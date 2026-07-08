@@ -25,6 +25,17 @@
       touch-action: none;
     }
     #c.dragging { cursor: grabbing; }
+    #c.ctrl-ready,
+    #c.selecting { cursor: crosshair; }
+    #marquee {
+      position: fixed;
+      display: none;
+      border: 1px solid rgba(255, 255, 255, 0.9);
+      background: rgba(140, 170, 255, 0.14);
+      box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+      pointer-events: none;
+      z-index: 2;
+    }
     #hud {
       position: fixed;
       top: 12px;
@@ -80,6 +91,7 @@
 </head>
 <body>
   <canvas id="c"></canvas>
+  <div id="marquee" aria-hidden="true"></div>
   <div id="hud">
     <div id="info"></div>
     <div id="actions">
@@ -170,13 +182,56 @@
     };
   }
 
+  /**
+   * Zoom so the axis-aligned pixel rect becomes the new viewport.
+   * Fits the selection fully, expanding on the short side to match canvas aspect.
+   * Pixel coords are in the same space as pixelToComplex (device pixels).
+   * Returns null if the rect is too small.
+   */
+  function zoomToRect(x0, y0, x1, y1, w, h, centerX, centerY, planeWidth) {
+    var left = Math.min(x0, x1);
+    var right = Math.max(x0, x1);
+    var top = Math.min(y0, y1);
+    var bottom = Math.max(y0, y1);
+    var pxW = right - left;
+    var pxH = bottom - top;
+    if (pxW < 4 || pxH < 4) return null;
+
+    var cTL = pixelToComplex(left, top, w, h, centerX, centerY, planeWidth);
+    var cBR = pixelToComplex(right, bottom, w, h, centerX, centerY, planeWidth);
+    var reMin = Math.min(cTL.re, cBR.re);
+    var reMax = Math.max(cTL.re, cBR.re);
+    var imMin = Math.min(cTL.im, cBR.im);
+    var imMax = Math.max(cTL.im, cBR.im);
+    var selW = reMax - reMin;
+    var selH = imMax - imMin;
+    var newCenterX = (reMin + reMax) / 2;
+    var newCenterY = (imMin + imMax) / 2;
+
+    // planeHeight = planeWidth / (w/h); fit both selW and selH
+    var aspect = w / h;
+    var newWidth = Math.max(selW, selH * aspect);
+    if (newWidth < Number.MIN_VALUE * 1e6) newWidth = Number.MIN_VALUE * 1e6;
+    if (!isFinite(newWidth) || newWidth > 1e6) {
+      newWidth = Math.min(Math.max(selW, selH * aspect), 1e6);
+    }
+    if (!isFinite(newWidth) || newWidth <= 0) return null;
+
+    return {
+      centerX: newCenterX,
+      centerY: newCenterY,
+      planeWidth: newWidth
+    };
+  }
+
   // Expose pure API for Node tests (no DOM dependency)
   var MandelbrotMath = {
     mandelbrotEscape: mandelbrotEscape,
     mandelbrotSmooth: mandelbrotSmooth,
     pixelToComplex: pixelToComplex,
     zoomAtPoint: zoomAtPoint,
-    panByPixels: panByPixels
+    panByPixels: panByPixels,
+    zoomToRect: zoomToRect
   };
   if (typeof globalThis !== "undefined") {
     globalThis.MandelbrotMath = MandelbrotMath;
@@ -332,10 +387,12 @@
     requestAnimationFrame(frame);
   }
 
-  // ── Input: pan + wheel zoom ────────────────────────────────────────────
+  // ── Input: pan + wheel zoom + Ctrl+drag marquee ────────────────────────
 
   var pointers = new Map();
   var lastPinchDist = 0;
+  var marqueeEl = document.getElementById("marquee");
+  var marquee = null; // { pointerId, x0, y0, x1, y1 } in client coords
 
   function cssToPixel(clientX, clientY) {
     var rect = canvas.getBoundingClientRect();
@@ -345,10 +402,89 @@
     };
   }
 
+  function updateMarqueeEl() {
+    if (!marquee) {
+      marqueeEl.style.display = "none";
+      return;
+    }
+    var left = Math.min(marquee.x0, marquee.x1);
+    var top = Math.min(marquee.y0, marquee.y1);
+    var width = Math.abs(marquee.x1 - marquee.x0);
+    var height = Math.abs(marquee.y1 - marquee.y0);
+    marqueeEl.style.display = "block";
+    marqueeEl.style.left = left + "px";
+    marqueeEl.style.top = top + "px";
+    marqueeEl.style.width = width + "px";
+    marqueeEl.style.height = height + "px";
+  }
+
+  function clearMarquee() {
+    marquee = null;
+    canvas.classList.remove("selecting");
+    // Keep crosshair if Ctrl is still held
+    if (ctrlHeld) canvas.classList.add("ctrl-ready");
+    updateMarqueeEl();
+  }
+
+  var ctrlHeld = false;
+  function setCtrlHeld(down) {
+    ctrlHeld = down;
+    if (marquee) return; // selecting class already owns the cursor
+    if (down) {
+      canvas.classList.add("ctrl-ready");
+      canvas.classList.remove("dragging");
+    } else {
+      canvas.classList.remove("ctrl-ready");
+    }
+  }
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Control") setCtrlHeld(true);
+  });
+  window.addEventListener("keyup", function (e) {
+    if (e.key === "Control") setCtrlHeld(false);
+  });
+  window.addEventListener("blur", function () {
+    setCtrlHeld(false);
+  });
+
+  function applyMarqueeZoom() {
+    if (!marquee) return;
+    var p0 = cssToPixel(marquee.x0, marquee.y0);
+    var p1 = cssToPixel(marquee.x1, marquee.y1);
+    var z = zoomToRect(
+      p0.x, p0.y, p1.x, p1.y,
+      imgW, imgH,
+      view.centerX, view.centerY, view.planeWidth
+    );
+    if (z) {
+      view.centerX = z.centerX;
+      view.centerY = z.centerY;
+      view.planeWidth = z.planeWidth;
+      requestRender();
+    }
+  }
+
   canvas.addEventListener("pointerdown", function (e) {
+    // Ctrl+drag: rubber-band zoom rect (primary button only)
+    if (e.ctrlKey && e.button === 0) {
+      e.preventDefault();
+      canvas.setPointerCapture(e.pointerId);
+      marquee = {
+        pointerId: e.pointerId,
+        x0: e.clientX,
+        y0: e.clientY,
+        x1: e.clientX,
+        y1: e.clientY
+      };
+      canvas.classList.remove("ctrl-ready", "dragging");
+      canvas.classList.add("selecting");
+      updateMarqueeEl();
+      return;
+    }
+
     canvas.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (pointers.size === 1) canvas.classList.add("dragging");
+    if (pointers.size === 1 && !ctrlHeld) canvas.classList.add("dragging");
     if (pointers.size === 2) {
       var pts = Array.from(pointers.values());
       var dx = pts[0].x - pts[1].x;
@@ -358,6 +494,16 @@
   });
 
   canvas.addEventListener("pointermove", function (e) {
+    // Sync Ctrl state from event (covers hold without prior keydown on this tab)
+    if (e.ctrlKey !== ctrlHeld && !marquee) setCtrlHeld(e.ctrlKey);
+
+    if (marquee && e.pointerId === marquee.pointerId) {
+      marquee.x1 = e.clientX;
+      marquee.y1 = e.clientY;
+      updateMarqueeEl();
+      return;
+    }
+
     if (!pointers.has(e.pointerId)) return;
     var prev = pointers.get(e.pointerId);
     var dx = e.clientX - prev.x;
@@ -390,12 +536,23 @@
   });
 
   function endPointer(e) {
+    if (marquee && e.pointerId === marquee.pointerId) {
+      applyMarqueeZoom();
+      clearMarquee();
+      return;
+    }
     pointers.delete(e.pointerId);
     if (pointers.size < 2) lastPinchDist = 0;
     if (pointers.size === 0) canvas.classList.remove("dragging");
   }
   canvas.addEventListener("pointerup", endPointer);
-  canvas.addEventListener("pointercancel", endPointer);
+  canvas.addEventListener("pointercancel", function (e) {
+    if (marquee && e.pointerId === marquee.pointerId) {
+      clearMarquee();
+      return;
+    }
+    endPointer(e);
+  });
   canvas.addEventListener("pointerleave", function (e) {
     if (pointers.has(e.pointerId) && e.buttons === 0) endPointer(e);
   });

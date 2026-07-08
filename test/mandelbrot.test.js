@@ -64,7 +64,13 @@ function loadShippedMath() {
 }
 
 const M = loadShippedMath();
-const { mandelbrotEscape, pixelToComplex, zoomAtPoint, panByPixels } = M;
+const {
+  mandelbrotEscape,
+  pixelToComplex,
+  zoomAtPoint,
+  panByPixels,
+  zoomToRect
+} = M;
 
 let passed = 0;
 function test(name, fn) {
@@ -187,6 +193,62 @@ test("pan delta magnitude matches plane scale", () => {
   assert.ok(Math.abs(next.centerX - expected) < 1e-12);
 });
 
+console.log("\nzoom-to-rect (shipped zoomToRect)");
+
+test("zoomToRect is exported", () => {
+  assert.strictEqual(typeof zoomToRect, "function");
+});
+
+test("zoomToRect centers on selection midpoint", () => {
+  // Center half of the canvas
+  const x0 = W * 0.25, x1 = W * 0.75;
+  const y0 = H * 0.25, y1 = H * 0.75;
+  const z = zoomToRect(x0, y0, x1, y1, W, H, CX, CY, PW);
+  assert.ok(z, "expected a view");
+  const mid = pixelToComplex((x0 + x1) / 2, (y0 + y1) / 2, W, H, CX, CY, PW);
+  assert.ok(Math.abs(z.centerX - mid.re) < 1e-9, "cx " + z.centerX + " vs " + mid.re);
+  assert.ok(Math.abs(z.centerY - mid.im) < 1e-9, "cy " + z.centerY + " vs " + mid.im);
+});
+
+test("zoomToRect shrinks plane width for a smaller selection", () => {
+  const z = zoomToRect(W * 0.25, H * 0.25, W * 0.75, H * 0.75, W, H, CX, CY, PW);
+  assert.ok(z.planeWidth < PW, "width " + z.planeWidth);
+  // Half the pixels in each axis → half plane span when aspect matches
+  assert.ok(Math.abs(z.planeWidth - PW * 0.5) < 1e-9, "expected half width, got " + z.planeWidth);
+});
+
+test("zoomToRect expands short side to match canvas aspect", () => {
+  // Very wide short box: height is limiting; planeWidth should fit height
+  const x0 = 100, x1 = 700, y0 = 290, y1 = 310; // 600×20 px
+  const z = zoomToRect(x0, y0, x1, y1, W, H, CX, CY, PW);
+  assert.ok(z);
+  const aspect = W / H;
+  const c0 = pixelToComplex(x0, y0, W, H, CX, CY, PW);
+  const c1 = pixelToComplex(x1, y1, W, H, CX, CY, PW);
+  const selW = Math.abs(c1.re - c0.re);
+  const selH = Math.abs(c1.im - c0.im);
+  const expected = Math.max(selW, selH * aspect);
+  assert.ok(Math.abs(z.planeWidth - expected) < 1e-9, z.planeWidth + " vs " + expected);
+  // Selection height should equal (or be less than) new plane height
+  const newPlaneH = z.planeWidth / aspect;
+  assert.ok(selH <= newPlaneH + 1e-9);
+  // Full selection width fits
+  assert.ok(selW <= z.planeWidth + 1e-9);
+});
+
+test("zoomToRect returns null for tiny rects", () => {
+  assert.strictEqual(zoomToRect(10, 10, 12, 12, W, H, CX, CY, PW), null);
+});
+
+test("zoomToRect is order-independent", () => {
+  const a = zoomToRect(100, 100, 400, 300, W, H, CX, CY, PW);
+  const b = zoomToRect(400, 300, 100, 100, W, H, CX, CY, PW);
+  assert.ok(a && b);
+  assert.ok(Math.abs(a.centerX - b.centerX) < 1e-12);
+  assert.ok(Math.abs(a.centerY - b.centerY) < 1e-12);
+  assert.ok(Math.abs(a.planeWidth - b.planeWidth) < 1e-12);
+});
+
 // Structural checks on the HTML artifact
 console.log("\nstatic structure (index.html)");
 
@@ -210,6 +272,12 @@ test("wheel and pointer handlers present", () => {
   assert.ok(/addEventListener\(\s*["']wheel["']/.test(html));
   assert.ok(/addEventListener\(\s*["']pointerdown["']/.test(html));
   assert.ok(/addEventListener\(\s*["']pointermove["']/.test(html));
+});
+
+test("ctrl marquee zoom bindings present", () => {
+  assert.ok(/ctrlKey/.test(html));
+  assert.ok(/zoomToRect/.test(html));
+  assert.ok(/marquee/.test(html));
 });
 
 test("minimal chrome: reset control only (sparse UI)", () => {
