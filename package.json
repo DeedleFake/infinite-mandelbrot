@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node test/mandelbrot.test.js",
     "test:browser": "node test/browser-check.mjs",
-    "test:perf": "node test/perf.mjs"
+    "test:perf": "node test/perf.mjs",
+    "test:deep": "node test/deep-zoom-quality.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.61.1"

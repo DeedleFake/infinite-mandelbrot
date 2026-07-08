@@ -273,6 +273,20 @@
     return data;
   }
 
+  /**
+   * Split a JS float64 into two float32s (hi, lo) so hi+lo ≈ x with double-single precision.
+   * Used to upload view params to the emulated-double WebGL path.
+   */
+  function splitDouble(x) {
+    var hi = Math.fround(x);
+    var lo = Math.fround(x - hi);
+    return { hi: hi, lo: lo };
+  }
+
+  function joinDouble(hi, lo) {
+    return hi + lo;
+  }
+
   // Expose pure API for Node tests (no DOM dependency for math)
   var MandelbrotMath = {
     mandelbrotEscape: mandelbrotEscape,
@@ -282,7 +296,9 @@
     panByPixels: panByPixels,
     zoomToRect: zoomToRect,
     colorFor: colorFor,
-    paintCpuFullFrame: paintCpuFullFrame
+    paintCpuFullFrame: paintCpuFullFrame,
+    splitDouble: splitDouble,
+    joinDouble: joinDouble
   };
   if (typeof globalThis !== "undefined") {
     globalThis.MandelbrotMath = MandelbrotMath;
@@ -332,14 +348,45 @@
     "attribute vec2 a_pos;\n" +
     "void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
 
-  // Fragment shader: same escape-time + palette as JS mandelbrotSmooth/colorFor.
-  // gl_FragCoord is bottom-left origin; map so +imag is up like the JS path.
+  // Fragment shader: escape-time + palette matching JS, with double-single (ds)
+  // arithmetic so deep zoom has float64-class precision (not native float32).
+  // Uniforms for center/planeWidth are split float64 pairs: vec2(hi, lo).
+  // gl_FragCoord is bottom-left; imag orientation matches the JS path.
   var FRAG_SRC =
     "precision highp float;\n" +
     "uniform vec2 u_res;\n" +
-    "uniform vec2 u_center;\n" +
-    "uniform float u_planeWidth;\n" +
+    "uniform vec2 u_centerX;\n" +
+    "uniform vec2 u_centerY;\n" +
+    "uniform vec2 u_planeWidth;\n" +
     "uniform float u_maxIter;\n" +
+    "\n" +
+    "// Double-single: vec2(hi, lo). Algorithms after Hida/Li/Bailey / NVIDIA ds.\n" +
+    "vec2 ds_add(vec2 a, vec2 b) {\n" +
+    "  float t1 = a.x + b.x;\n" +
+    "  float e = t1 - a.x;\n" +
+    "  float t2 = ((b.x - e) + (a.x - (t1 - e))) + a.y + b.y;\n" +
+    "  float hi = t1 + t2;\n" +
+    "  return vec2(hi, t2 - (hi - t1));\n" +
+    "}\n" +
+    "vec2 ds_sub(vec2 a, vec2 b) {\n" +
+    "  return ds_add(a, vec2(-b.x, -b.y));\n" +
+    "}\n" +
+    "vec2 ds_mul(vec2 a, vec2 b) {\n" +
+    "  float cona = a.x * 8193.0;\n" +
+    "  float conb = b.x * 8193.0;\n" +
+    "  float a1 = cona - (cona - a.x);\n" +
+    "  float b1 = conb - (conb - b.x);\n" +
+    "  float a2 = a.x - a1;\n" +
+    "  float b2 = b.x - b1;\n" +
+    "  float c11 = a.x * b.x;\n" +
+    "  float c21 = a2 * b2 + (a2 * b1 + (a1 * b2 + (a1 * b1 - c11)));\n" +
+    "  float c2 = a.x * b.y + a.y * b.x;\n" +
+    "  float t1 = c11 + c2;\n" +
+    "  float e = t1 - c11;\n" +
+    "  float t2 = ((c2 - e) + (c11 - (t1 - e))) + c21 + a.y * b.y;\n" +
+    "  float hi = t1 + t2;\n" +
+    "  return vec2(hi, t2 - (hi - t1));\n" +
+    "}\n" +
     "\n" +
     "vec3 hsl2rgb(float h, float s, float l) {\n" +
     "  float c = (1.0 - abs(2.0 * l - 1.0)) * s;\n" +
@@ -358,23 +405,27 @@
     "\n" +
     "void main() {\n" +
     "  float aspect = u_res.x / u_res.y;\n" +
-    "  float planeHeight = u_planeWidth / aspect;\n" +
-    "  // bottom-left → match JS top-left imag orientation\n" +
-    "  float re = u_center.x + (gl_FragCoord.x / u_res.x - 0.5) * u_planeWidth;\n" +
-    "  float im = u_center.y + (gl_FragCoord.y / u_res.y - 0.5) * planeHeight;\n" +
+    "  // planeHeight = planeWidth / aspect (aspect is O(1); mul by reciprocal is fine)\n" +
+    "  vec2 planeHeight = ds_mul(u_planeWidth, vec2(1.0 / aspect, 0.0));\n" +
+    "  vec2 tRe = vec2(gl_FragCoord.x / u_res.x - 0.5, 0.0);\n" +
+    "  vec2 tIm = vec2(gl_FragCoord.y / u_res.y - 0.5, 0.0);\n" +
+    "  vec2 re = ds_add(u_centerX, ds_mul(tRe, u_planeWidth));\n" +
+    "  vec2 im = ds_add(u_centerY, ds_mul(tIm, planeHeight));\n" +
     "\n" +
-    "  float zx = 0.0;\n" +
-    "  float zy = 0.0;\n" +
-    "  float zx2 = 0.0;\n" +
-    "  float zy2 = 0.0;\n" +
+    "  vec2 zx = vec2(0.0);\n" +
+    "  vec2 zy = vec2(0.0);\n" +
     "  float i = 0.0;\n" +
-    "  // Hard cap matches iterationsForZoom max (4096)\n" +
+    "  float mag2 = 0.0;\n" +
     "  for (int n = 0; n < 4096; n++) {\n" +
-    "    if (i >= u_maxIter || zx2 + zy2 > 256.0) break;\n" +
-    "    zy = 2.0 * zx * zy + im;\n" +
-    "    zx = zx2 - zy2 + re;\n" +
-    "    zx2 = zx * zx;\n" +
-    "    zy2 = zy * zy;\n" +
+    "    if (i >= u_maxIter || mag2 > 256.0) break;\n" +
+    "    // z <- z^2 + c  with double-single ops\n" +
+    "    vec2 zx2 = ds_mul(zx, zx);\n" +
+    "    vec2 zy2 = ds_mul(zy, zy);\n" +
+    "    vec2 zxzy = ds_mul(zx, zy);\n" +
+    "    zy = ds_add(ds_add(zxzy, zxzy), im);\n" +
+    "    zx = ds_add(ds_sub(zx2, zy2), re);\n" +
+    "    // |z|^2 from high parts (+ cross terms) for bailout\n" +
+    "    mag2 = zx.x * zx.x + zy.x * zy.x;\n" +
     "    i += 1.0;\n" +
     "  }\n" +
     "\n" +
@@ -382,7 +433,7 @@
     "    gl_FragColor = vec4(8.0/255.0, 8.0/255.0, 12.0/255.0, 1.0);\n" +
     "    return;\n" +
     "  }\n" +
-    "  float logZn = log(zx2 + zy2) * 0.5;\n" +
+    "  float logZn = log(mag2) * 0.5;\n" +
     "  float nu = log(logZn / log(2.0)) / log(2.0);\n" +
     "  float t = i + 1.0 - nu;\n" +
     "  float v = t / u_maxIter;\n" +
@@ -444,7 +495,8 @@
 
     var uniforms = {
       res: g.getUniformLocation(prog, "u_res"),
-      center: g.getUniformLocation(prog, "u_center"),
+      centerX: g.getUniformLocation(prog, "u_centerX"),
+      centerY: g.getUniformLocation(prog, "u_centerY"),
       planeWidth: g.getUniformLocation(prog, "u_planeWidth"),
       maxIter: g.getUniformLocation(prog, "u_maxIter")
     };
@@ -498,8 +550,12 @@
     g.viewport(0, 0, imgW, imgH);
     g.useProgram(glProgram);
     g.uniform2f(glUniforms.res, imgW, imgH);
-    g.uniform2f(glUniforms.center, view.centerX, view.centerY);
-    g.uniform1f(glUniforms.planeWidth, view.planeWidth);
+    var cx = splitDouble(view.centerX);
+    var cy = splitDouble(view.centerY);
+    var pw = splitDouble(view.planeWidth);
+    g.uniform2f(glUniforms.centerX, cx.hi, cx.lo);
+    g.uniform2f(glUniforms.centerY, cy.hi, cy.lo);
+    g.uniform2f(glUniforms.planeWidth, pw.hi, pw.lo);
     g.uniform1f(glUniforms.maxIter, maxIter);
     g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
     if (sync) {
@@ -761,6 +817,102 @@
       paintCpuFullFrame(w, h, cx, cy, pw, mi, buf);
       var t1 = performance.now();
       return { ms: t1 - t0, backend: "cpu", w: w, h: h, maxIter: mi, bytes: buf.length };
+    },
+    /**
+     * Sample unique RGB colors on a grid from the current framebuffer.
+     */
+    sampleUniqueColors: function (step) {
+      step = step || 8;
+      var w = imgW, h = imgH;
+      var pixels;
+      if (backend === "webgl" && gl) {
+        pixels = new Uint8Array(w * h * 4);
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      } else if (ctx2d) {
+        pixels = ctx2d.getImageData(0, 0, w, h).data;
+      } else {
+        return { unique: 0, samples: 0, backend: backend };
+      }
+      var set = {};
+      var count = 0;
+      var unique = 0;
+      for (var y = 0; y < h; y += step) {
+        for (var x = 0; x < w; x += step) {
+          var i = (y * w + x) * 4;
+          var key = pixels[i] + "," + pixels[i + 1] + "," + pixels[i + 2];
+          count++;
+          if (!set[key]) {
+            set[key] = 1;
+            unique++;
+          }
+        }
+      }
+      return { unique: unique, samples: count, backend: backend, w: w, h: h };
+    },
+    /**
+     * Paint a fixed deep window on the live backend and sample uniqueness
+     * before restoring the interactive view (so the frame is still readable).
+     */
+    deepZoomQuality: function (opts) {
+      opts = opts || {};
+      var w = opts.w || 320;
+      var h = opts.h || 240;
+      var cx = opts.centerX != null ? opts.centerX : -0.743643887037151;
+      var cy = opts.centerY != null ? opts.centerY : 0.13182590420533;
+      var pw = opts.planeWidth != null ? opts.planeWidth : 1e-7;
+      var mi = opts.maxIter != null ? opts.maxIter : 2048;
+      var step = opts.step || 4;
+
+      var prev = {
+        w: imgW, h: imgH,
+        cx: view.centerX, cy: view.centerY, pw: view.planeWidth, mi: maxIter
+      };
+
+      imgW = w;
+      imgH = h;
+      view.centerX = cx;
+      view.centerY = cy;
+      view.planeWidth = pw;
+      maxIter = mi;
+      canvas.width = w;
+      canvas.height = h;
+      if (backend === "webgl") {
+        gl = null;
+        glProgram = null;
+        glUniforms = null;
+        ensureWebGL();
+      } else if (ctx2d) {
+        imageData = ctx2d.createImageData(w, h);
+      }
+
+      if (backend === "webgl" && gl) {
+        paintWebGL(true);
+      } else {
+        if (!imageData && ctx2d) imageData = ctx2d.createImageData(w, h);
+        paintCpuFullFrame(w, h, cx, cy, pw, mi, imageData.data);
+        ctx2d.putImageData(imageData, 0, 0);
+      }
+
+      var metrics = this.sampleUniqueColors(step);
+
+      imgW = prev.w;
+      imgH = prev.h;
+      view.centerX = prev.cx;
+      view.centerY = prev.cy;
+      view.planeWidth = prev.pw;
+      maxIter = prev.mi;
+      canvas.width = prev.w;
+      canvas.height = prev.h;
+      if (backend === "webgl") {
+        gl = null;
+        glProgram = null;
+        glUniforms = null;
+        ensureWebGL();
+      } else if (ctx2d) {
+        imageData = ctx2d.createImageData(prev.w, prev.h);
+      }
+      dirty = true;
+      return metrics;
     }
   };
   if (typeof globalThis !== "undefined") {

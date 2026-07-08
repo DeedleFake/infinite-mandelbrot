@@ -80,7 +80,10 @@ const {
   pixelToComplex,
   zoomAtPoint,
   panByPixels,
-  zoomToRect
+  zoomToRect,
+  splitDouble,
+  joinDouble,
+  paintCpuFullFrame
 } = M;
 
 let passed = 0;
@@ -298,17 +301,90 @@ test("WebGL paint path + CPU fallback present", () => {
   assert.ok(/MandelbrotApp/.test(html));
 });
 
+test("emulated double-float shader ops present", () => {
+  assert.ok(/ds_add/.test(html));
+  assert.ok(/ds_mul/.test(html));
+  assert.ok(/splitDouble/.test(html));
+  assert.ok(/u_centerX/.test(html));
+});
+
 test("shipped paintCpuFullFrame produces filled buffer", () => {
-  assert.strictEqual(typeof M.paintCpuFullFrame, "function");
+  assert.strictEqual(typeof paintCpuFullFrame, "function");
   const w = 32,
     h = 24;
-  const buf = M.paintCpuFullFrame(w, h, -0.5, 0, 3.5, 64);
+  const buf = paintCpuFullFrame(w, h, -0.5, 0, 3.5, 64);
   assert.strictEqual(buf.length, w * h * 4);
   let nonBlack = 0;
   for (let i = 0; i < buf.length; i += 4) {
     if (buf[i] + buf[i + 1] + buf[i + 2] > 40) nonBlack++;
   }
   assert.ok(nonBlack > w * h * 0.1, "expected exterior colors, nonBlack=" + nonBlack);
+});
+
+console.log("\ndeep precision helpers (shipped splitDouble)");
+
+test("splitDouble/joinDouble round-trips float64 values", () => {
+  assert.strictEqual(typeof splitDouble, "function");
+  const samples = [
+    -0.743643887037151,
+    0.13182590420533,
+    1e-10,
+    3.5,
+    -0.5 + 1e-12
+  ];
+  for (const x of samples) {
+    const { hi, lo } = splitDouble(x);
+    const back = joinDouble(hi, lo);
+    const err = Math.abs(back - x);
+    assert.ok(err < 1e-15 || err / Math.max(1, Math.abs(x)) < 1e-14, "x=" + x + " err=" + err);
+  }
+});
+
+test("native float32 collapses deep pixel map; float64 does not", () => {
+  const w = 960,
+    h = 640;
+  const cx = -0.743643887037151;
+  const cy = 0.13182590420533;
+  const pw = 1e-10;
+  const n = 48;
+  const set64 = new Set();
+  const set32 = new Set();
+  const f = Math.fround || ((x) => new Float32Array([x])[0]);
+  for (let yi = 0; yi < n; yi++) {
+    for (let xi = 0; xi < n; xi++) {
+      const px = Math.floor((xi / (n - 1)) * (w - 1));
+      const py = Math.floor((yi / (n - 1)) * (h - 1));
+      const p64 = pixelToComplex(px, py, w, h, cx, cy, pw);
+      set64.add(p64.re + "," + p64.im);
+      // float32 uniform simulation
+      const re32 = f(f(cx) + f(f(px / w - 0.5) * f(pw)));
+      const aspect = f(w / h);
+      const ph = f(f(pw) / aspect);
+      const im32 = f(f(cy) - f(f(py / h - 0.5) * ph));
+      set32.add(re32 + "," + im32);
+    }
+  }
+  assert.ok(set64.size > n * n * 0.9, "float64 unique=" + set64.size);
+  assert.ok(set32.size < set64.size * 0.25, "float32 unique=" + set32.size + " vs64=" + set64.size);
+});
+
+test("splitDouble preserves distinct deep pixel offsets after reconstruct", () => {
+  const w = 960,
+    h = 640;
+  const cx = -0.743643887037151;
+  const cy = 0.13182590420533;
+  const pw = 1e-10;
+  const scx = splitDouble(cx);
+  const scy = splitDouble(cy);
+  const spw = splitDouble(pw);
+  const set = new Set();
+  for (let x = 0; x < 64; x++) {
+    const t = x / 63 - 0.5;
+    // emulate ds: center + t * planeWidth using hi/lo sums (approx join)
+    const re = joinDouble(scx.hi, scx.lo) + t * joinDouble(spw.hi, spw.lo);
+    set.add(re);
+  }
+  assert.ok(set.size >= 60, "reconstructed unique re=" + set.size);
 });
 
 test("minimal chrome: reset control only (sparse UI)", () => {

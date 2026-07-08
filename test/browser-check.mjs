@@ -11,7 +11,7 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const SCRATCH =
-  process.env.SCRATCH || "/tmp/grok-goal-70878daad40d/implementer";
+  process.env.SCRATCH || "/tmp/grok-goal-0629836d73da/implementer";
 const HTML = readFileSync(join(ROOT, "index.html"));
 
 mkdirSync(SCRATCH, { recursive: true });
