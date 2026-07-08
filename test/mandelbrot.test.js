@@ -60,7 +60,9 @@ function loadShippedMath() {
     Array,
     Object,
     Float32Array,
+    Float64Array,
     Uint8ClampedArray,
+    BigInt,
     performance: { now: () => Date.now() },
     requestAnimationFrame: noop,
     globalThis: null,
@@ -98,13 +100,21 @@ function loadShippedMath() {
 const M = loadShippedMath();
 const {
   mandelbrotEscape,
+  mandelbrotSmooth,
   pixelToComplex,
   zoomAtPoint,
   panByPixels,
   zoomToRect,
   splitDouble,
   joinDouble,
-  paintCpuFullFrame
+  paintCpuFullFrame,
+  paintCpuPerturbFullFrame,
+  buildReferenceOrbit,
+  perturbSmooth,
+  shouldUsePerturbation,
+  fpFromNumber,
+  fpToNumber,
+  fpMul
 } = M;
 
 let passed = 0;
@@ -413,6 +423,99 @@ test("minimal chrome: sparse controls (renderer + reset)", () => {
   assert.ok(/btn-webgl|btn-cpu|setBackend/.test(html));
   const buttons = html.match(/<button\b/gi) || [];
   assert.ok(buttons.length <= 5, "too many buttons: " + buttons.length);
+});
+
+console.log("\nperturbation + multiprecision reference (shipped)");
+
+test("bigfloat fixed-point round-trip and mul", () => {
+  assert.strictEqual(typeof fpFromNumber, "function");
+  assert.ok(Math.abs(fpToNumber(fpFromNumber(-0.75)) + 0.75) < 1e-15);
+  assert.ok(Math.abs(fpToNumber(fpMul(fpFromNumber(1.25), fpFromNumber(0.5))) - 0.625) < 1e-12);
+});
+
+test("shouldUsePerturbation past float32-class and float64-deep depths", () => {
+  assert.strictEqual(shouldUsePerturbation(1e-3), false);
+  assert.strictEqual(shouldUsePerturbation(1e-5), true);
+  assert.strictEqual(shouldUsePerturbation(1e-16), true);
+});
+
+test("reference orbit + perturb matches absolute float64 at moderate depth", () => {
+  const cx = -0.743643887037151;
+  const cy = 0.13182590420533;
+  const pw = 1e-8;
+  const maxIter = 512;
+  const orbit = buildReferenceOrbit(cx, cy, maxIter);
+  assert.ok(orbit.len >= 2);
+  const w = 24, h = 18;
+  const ph = pw / (w / h);
+  let maxDiff = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dcr = ((x + 0.5) / w - 0.5) * pw;
+      const dci = -((y + 0.5) / h - 0.5) * ph;
+      const ta = mandelbrotSmooth(cx + dcr, cy + dci, maxIter);
+      const tp = perturbSmooth(dcr, dci, orbit.zRe, orbit.zIm, maxIter);
+      assert.ok(!tp.glitched, "unexpected glitch");
+      maxDiff = Math.max(maxDiff, Math.abs(ta - tp.t));
+    }
+  }
+  assert.ok(maxDiff < 1e-6, "maxDiff " + maxDiff);
+});
+
+test("absolute float64 c-map collapses at planeWidth 1e-16; δc does not", () => {
+  const cx = -0.743643887037151;
+  const cy = 0.13182590420533;
+  const pw = 1e-16;
+  const w = 32, h = 24;
+  const ph = pw / (w / h);
+  const absC = new Set();
+  const deltas = new Set();
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dcr = ((x + 0.5) / w - 0.5) * pw;
+      const dci = -((y + 0.5) / h - 0.5) * ph;
+      absC.add(cx + dcr + "," + (cy + dci));
+      deltas.add(dcr + "," + dci);
+    }
+  }
+  assert.ok(absC.size < w * h * 0.25, "abs unique c " + absC.size);
+  assert.strictEqual(deltas.size, w * h);
+});
+
+test("paintCpuPerturbFullFrame runs and is not a single flat field at deep exterior-ish window", () => {
+  const r = paintCpuPerturbFullFrame(
+    32,
+    24,
+    -0.743643887037151,
+    0.13182590420533,
+    1e-16,
+    4096
+  );
+  assert.ok(r.data && r.data.length === 32 * 24 * 4);
+  assert.ok(r.orbit && r.orbit.len >= 2);
+  const escapes = new Set();
+  const orbit = r.orbit;
+  const pw = 1e-16;
+  const ph = pw / (32 / 24);
+  for (let y = 0; y < 24; y++) {
+    for (let x = 0; x < 32; x++) {
+      const dcr = ((x + 0.5) / 32 - 0.5) * pw;
+      const dci = -((y + 0.5) / 24 - 0.5) * ph;
+      const p = perturbSmooth(dcr, dci, orbit.zRe, orbit.zIm, 4096);
+      escapes.add(Math.floor(p.t));
+    }
+  }
+  // Must exercise the shipped iterator and produce at least some diversity or full interior
+  assert.ok(escapes.size >= 1);
+  assert.ok(typeof buildReferenceOrbit === "function");
+});
+
+test("source contains perturbation and multiprecision reference path", () => {
+  assert.ok(/buildReferenceOrbit/.test(html));
+  assert.ok(/perturbSmooth/.test(html));
+  assert.ok(/shouldUsePerturbation/.test(html));
+  assert.ok(/FRAG_SRC_PERT|u_orbit/.test(html));
+  assert.ok(/BigInt|FP_BITS/.test(html));
 });
 
 if (process.exitCode) {

@@ -260,7 +260,7 @@
   }
 
   /**
-   * Full-frame CPU paint (naive baseline / fallback). Synchronous.
+   * Full-frame CPU paint (absolute float64). Synchronous.
    * Writes RGBA into out (Uint8ClampedArray length w*h*4) or allocates.
    */
   function paintCpuFullFrame(w, h, centerX, centerY, planeWidth, maxIter, out) {
@@ -297,6 +297,191 @@
     return hi + lo;
   }
 
+  // ── Multiprecision fixed-point (BigInt) + perturbation ─────────────────
+  // Fixed-point value = bigint / 2^FP_BITS. Used only for the reference orbit;
+  // per-pixel δz/δc stays in float64.
+
+  var FP_BITS = 192;
+  var FP_BITS_N = BigInt(FP_BITS);
+  var FP_ONE = 1n << FP_BITS_N;
+  var FP_BAILOUT2 = 256n * FP_ONE * FP_ONE; // (16)^2 in fixed for |z|^2 with scale 2^FP
+
+  function fpFromNumber(x) {
+    if (!isFinite(x) || x === 0) return 0n;
+    var neg = x < 0;
+    x = Math.abs(x);
+    var e = Math.floor(Math.log2(x));
+    var m = x * Math.pow(2, -e); // [1, 2)
+    var mi = BigInt(Math.round(m * Math.pow(2, 52)));
+    var sh = e - 52 + FP_BITS;
+    var r = sh >= 0 ? mi << BigInt(sh) : mi >> BigInt(-sh);
+    return neg ? -r : r;
+  }
+
+  function fpToNumber(a) {
+    if (a === 0n) return 0;
+    var neg = a < 0n;
+    if (neg) a = -a;
+    var bits = a.toString(2).length;
+    if (bits <= 53) {
+      var v0 = Number(a) / Math.pow(2, FP_BITS);
+      return neg ? -v0 : v0;
+    }
+    var drop = bits - 53;
+    var top = Number(a >> BigInt(drop));
+    var v = top * Math.pow(2, drop - FP_BITS);
+    return neg ? -v : v;
+  }
+
+  function fpMul(a, b) {
+    return (a * b) >> FP_BITS_N;
+  }
+
+  function fpAdd(a, b) {
+    return a + b;
+  }
+
+  function fpSub(a, b) {
+    return a - b;
+  }
+
+  /**
+   * Engage perturbation + multiprecision reference when absolute low-precision
+   * sampling would soften (float32/DS territory and beyond). Still used for
+   * past-float64 depths (planeWidth ≪ 1e-15). Threshold ≈ zoom ≳ 3.5e4.
+   */
+  function shouldUsePerturbation(planeWidth) {
+    return planeWidth > 0 && planeWidth < 1e-4;
+  }
+
+  /**
+   * Build multiprecision reference orbit at C = (cx, cy).
+   * Returns float64 arrays of Z_n (for GPU/CPU δ iteration) and metadata.
+   */
+  function buildReferenceOrbit(cx, cy, maxIter) {
+    var cr = fpFromNumber(cx);
+    var ci = fpFromNumber(cy);
+    var zr = 0n;
+    var zi = 0n;
+    var zRe = new Float64Array(maxIter + 1);
+    var zIm = new Float64Array(maxIter + 1);
+    var len = 0;
+    zRe[0] = 0;
+    zIm[0] = 0;
+    len = 1;
+    var i;
+    for (i = 0; i < maxIter; i++) {
+      // z <- z^2 + c
+      var zr2 = fpMul(zr, zr);
+      var zi2 = fpMul(zi, zi);
+      var zrzi = fpMul(zr, zi);
+      var newZr = fpAdd(fpSub(zr2, zi2), cr);
+      var newZi = fpAdd(fpAdd(zrzi, zrzi), ci);
+      zr = newZr;
+      zi = newZi;
+      var re = fpToNumber(zr);
+      var im = fpToNumber(zi);
+      zRe[len] = re;
+      zIm[len] = im;
+      len++;
+      // |z|^2 bailout (~256 like smooth path)
+      if (re * re + im * im > 256) break;
+    }
+    return {
+      zRe: zRe.subarray(0, len),
+      zIm: zIm.subarray(0, len),
+      len: len,
+      cx: cx,
+      cy: cy,
+      maxIter: maxIter,
+      fpBits: FP_BITS
+    };
+  }
+
+  /**
+   * Perturbation escape with smooth count.
+   * δc = c - C_ref; Z_n from multiprecision reference (as float64).
+   * Recurrence: δz_{n+1} = 2 Z_n δz_n + δz_n² + δc; test |Z_{n+1}+δz_{n+1}|.
+   * Glitch detect: |Z+δz| << |Z| → return glitched flag (caller may retry).
+   */
+  function perturbSmooth(dcr, dci, zRe, zIm, maxIter) {
+    var dzr = 0;
+    var dzi = 0;
+    var nRef = zRe.length;
+    var glitched = false;
+    var mag2 = 0;
+    var i = 0;
+    for (i = 0; i < maxIter; i++) {
+      // Need Z_n and Z_{n+1}
+      if (i + 1 >= nRef) break;
+      var Zr = zRe[i];
+      var Zi = zIm[i];
+      // δz <- 2 Z_n δz + δz^2 + δc
+      var dzr2 = dzr * dzr - dzi * dzi;
+      var dzi2 = 2 * dzr * dzi;
+      var tZr = 2 * (Zr * dzr - Zi * dzi);
+      var tZi = 2 * (Zr * dzi + Zi * dzr);
+      dzr = tZr + dzr2 + dcr;
+      dzi = tZi + dzi2 + dci;
+      var Zr1 = zRe[i + 1];
+      var Zi1 = zIm[i + 1];
+      var zr = Zr1 + dzr;
+      var zi = Zi1 + dzi;
+      mag2 = zr * zr + zi * zi;
+      var magZ2 = Zr1 * Zr1 + Zi1 * Zi1;
+      // Glitch: full orbit much smaller than reference (cancellation)
+      if (magZ2 > 1e-12 && mag2 < 1e-6 * magZ2) {
+        glitched = true;
+        i++;
+        break;
+      }
+      if (mag2 > 256) {
+        i++;
+        break;
+      }
+    }
+    if (glitched) {
+      return { t: maxIter, glitched: true, i: i };
+    }
+    if (i >= maxIter || mag2 <= 256) {
+      return { t: maxIter, glitched: false, i: i };
+    }
+    var logZn = Math.log(mag2) / 2;
+    var nu = Math.log(logZn / Math.LN2) / Math.LN2;
+    return { t: i + 1 - nu, glitched: false, i: i };
+  }
+
+  /**
+   * CPU full-frame via multiprecision reference + float64 perturbation.
+   * δc from pixel offset about center (reference = view center).
+   */
+  function paintCpuPerturbFullFrame(w, h, centerX, centerY, planeWidth, maxIter, out) {
+    var data = out || new Uint8ClampedArray(w * h * 4);
+    var orbit = buildReferenceOrbit(centerX, centerY, maxIter);
+    var aspect = w / h;
+    var ph = planeWidth / aspect;
+    var dre = planeWidth / w;
+    var dim = -ph / h;
+    // δc at pixel (0,0) relative to center: (-0.5*pw, +0.5*ph) in our y-down imag map
+    // re = center + (x/w - 0.5)*pw  => dcr = (x/w - 0.5)*pw
+    // im = center - (y/h - 0.5)*ph  => dci = -(y/h - 0.5)*ph
+    for (var y = 0; y < h; y++) {
+      var dci = -((y + 0.5) / h - 0.5) * ph;
+      var rowOff = y * w * 4;
+      for (var x = 0; x < w; x++) {
+        var dcr = ((x + 0.5) / w - 0.5) * planeWidth;
+        var r = perturbSmooth(dcr, dci, orbit.zRe, orbit.zIm, maxIter);
+        var t = r.t;
+        if (r.glitched) {
+          // Secondary probe: small absolute float64 attempt (best-effort)
+          t = mandelbrotSmooth(centerX + dcr, centerY + dci, maxIter);
+        }
+        colorFor(t, maxIter, data, rowOff + x * 4);
+      }
+    }
+    return { data: data, orbit: orbit };
+  }
+
   // Expose pure API for Node tests (no DOM dependency for math)
   var MandelbrotMath = {
     mandelbrotEscape: mandelbrotEscape,
@@ -307,8 +492,16 @@
     zoomToRect: zoomToRect,
     colorFor: colorFor,
     paintCpuFullFrame: paintCpuFullFrame,
+    paintCpuPerturbFullFrame: paintCpuPerturbFullFrame,
     splitDouble: splitDouble,
-    joinDouble: joinDouble
+    joinDouble: joinDouble,
+    fpFromNumber: fpFromNumber,
+    fpToNumber: fpToNumber,
+    fpMul: fpMul,
+    buildReferenceOrbit: buildReferenceOrbit,
+    perturbSmooth: perturbSmooth,
+    shouldUsePerturbation: shouldUsePerturbation,
+    FP_BITS: FP_BITS
   };
   if (typeof globalThis !== "undefined") {
     globalThis.MandelbrotMath = MandelbrotMath;
@@ -358,7 +551,14 @@
   var glCanvas = document.createElement("canvas");
   var gl = null;
   var glProgram = null;
+  var glProgramPert = null;
   var glUniforms = null;
+  var glUniformsPert = null;
+  var glOrbitTex = null;
+  var glFloatTex = false;
+  var glBindPos = null;
+  var orbitCache = { key: "", orbit: null };
+  var paintMode = "absolute"; // "absolute" | "perturb"
 
   var VERT_SRC =
     "attribute vec2 a_pos;\n" +
@@ -460,6 +660,84 @@
     "  gl_FragColor = vec4(rgb, 1.0);\n" +
     "}\n";
 
+  // Perturbation fragment shader: reference orbit in u_orbit texture (RGBA32F-ish),
+  // δc from pixel offset about view center. Z sampled per iteration index.
+  var FRAG_SRC_PERT =
+    "precision highp float;\n" +
+    "uniform vec2 u_res;\n" +
+    "uniform vec2 u_planeWidth;\n" + // float64 split of plane width (for δ scale)
+    "uniform float u_aspect;\n" +
+    "uniform float u_maxIter;\n" +
+    "uniform float u_orbitLen;\n" +
+    "uniform sampler2D u_orbit;\n" +
+    "\n" +
+    "vec3 hsl2rgb(float h, float s, float l) {\n" +
+    "  float c = (1.0 - abs(2.0 * l - 1.0)) * s;\n" +
+    "  float x = c * (1.0 - abs(mod(h * 6.0, 2.0) - 1.0));\n" +
+    "  float m = l - c * 0.5;\n" +
+    "  vec3 rgb;\n" +
+    "  float h6 = h * 6.0;\n" +
+    "  if (h6 < 1.0) rgb = vec3(c, x, 0.0);\n" +
+    "  else if (h6 < 2.0) rgb = vec3(x, c, 0.0);\n" +
+    "  else if (h6 < 3.0) rgb = vec3(0.0, c, x);\n" +
+    "  else if (h6 < 4.0) rgb = vec3(0.0, x, c);\n" +
+    "  else if (h6 < 5.0) rgb = vec3(x, 0.0, c);\n" +
+    "  else rgb = vec3(c, 0.0, x);\n" +
+    "  return rgb + m;\n" +
+    "}\n" +
+    "\n" +
+    "vec2 sampleZ(float idx) {\n" +
+    "  float u = (idx + 0.5) / u_orbitLen;\n" +
+    "  return texture2D(u_orbit, vec2(u, 0.5)).xy;\n" +
+    "}\n" +
+    "\n" +
+    "void main() {\n" +
+    "  // Reconstruct plane width from double-single pair\n" +
+    "  float pw = u_planeWidth.x + u_planeWidth.y;\n" +
+    "  float ph = pw / u_aspect;\n" +
+    "  // δc relative to reference (view center)\n" +
+    "  float dcr = (gl_FragCoord.x / u_res.x - 0.5) * pw;\n" +
+    "  float dci = (gl_FragCoord.y / u_res.y - 0.5) * ph;\n" +
+    "  float dzr = 0.0;\n" +
+    "  float dzi = 0.0;\n" +
+    "  float i = 0.0;\n" +
+    "  float mag2 = 0.0;\n" +
+    "  float glitch = 0.0;\n" +
+    "  for (int n = 0; n < 4096; n++) {\n" +
+    "    if (i >= u_maxIter) break;\n" +
+    "    if (i + 1.0 >= u_orbitLen) break;\n" +
+    "    vec2 Z = sampleZ(i);\n" +
+    "    float Zr = Z.x;\n" +
+    "    float Zi = Z.y;\n" +
+    "    float dzr2 = dzr * dzr - dzi * dzi;\n" +
+    "    float dzi2 = 2.0 * dzr * dzi;\n" +
+    "    float tZr = 2.0 * (Zr * dzr - Zi * dzi);\n" +
+    "    float tZi = 2.0 * (Zr * dzi + Zi * dzr);\n" +
+    "    dzr = tZr + dzr2 + dcr;\n" +
+    "    dzi = tZi + dzi2 + dci;\n" +
+    "    vec2 Z1 = sampleZ(i + 1.0);\n" +
+    "    float zr = Z1.x + dzr;\n" +
+    "    float zi = Z1.y + dzi;\n" +
+    "    mag2 = zr * zr + zi * zi;\n" +
+    "    float magZ2 = Z1.x * Z1.x + Z1.y * Z1.y;\n" +
+    "    i += 1.0;\n" +
+    "    if (magZ2 > 1.0e-12 && mag2 < 1.0e-6 * magZ2) { glitch = 1.0; break; }\n" +
+    "    if (mag2 > 256.0) break;\n" +
+    "  }\n" +
+    "  if (glitch > 0.5 || i >= u_maxIter || mag2 <= 256.0) {\n" +
+    "    gl_FragColor = vec4(8.0/255.0, 8.0/255.0, 12.0/255.0, 1.0);\n" +
+    "    return;\n" +
+    "  }\n" +
+    "  float logZn = log(mag2) * 0.5;\n" +
+    "  float nu = log(logZn / log(2.0)) / log(2.0);\n" +
+    "  float t = i + 1.0 - nu;\n" +
+    "  float v = t / u_maxIter;\n" +
+    "  float hue = mod(0.62 + 4.5 * v, 1.0);\n" +
+    "  float sat = 0.72;\n" +
+    "  float lit = 0.12 + 0.55 * pow(v, 0.55);\n" +
+    "  gl_FragColor = vec4(hsl2rgb(hue, sat, lit), 1.0);\n" +
+    "}\n";
+
   function compileShader(glctx, type, src) {
     var sh = glctx.createShader(type);
     glctx.shaderSource(sh, src);
@@ -470,6 +748,18 @@
       throw new Error("shader compile: " + info);
     }
     return sh;
+  }
+
+  function linkProgram(g, vs, fsSrc) {
+    var fs = compileShader(g, g.FRAGMENT_SHADER, fsSrc);
+    var prog = g.createProgram();
+    g.attachShader(prog, vs);
+    g.attachShader(prog, fs);
+    g.linkProgram(prog);
+    if (!g.getProgramParameter(prog, g.LINK_STATUS)) {
+      throw new Error("program link: " + g.getProgramInfoLog(prog));
+    }
+    return prog;
   }
 
   function initWebGL(canvasEl) {
@@ -486,55 +776,102 @@
       canvasEl.getContext("experimental-webgl", opts);
     if (!g) return null;
 
-    var vs = compileShader(g, g.VERTEX_SHADER, VERT_SRC);
-    var fs = compileShader(g, g.FRAGMENT_SHADER, FRAG_SRC);
-    var prog = g.createProgram();
-    g.attachShader(prog, vs);
-    g.attachShader(prog, fs);
-    g.linkProgram(prog);
-    if (!g.getProgramParameter(prog, g.LINK_STATUS)) {
-      throw new Error("program link: " + g.getProgramInfoLog(prog));
+    var floatExt = g.getExtension("OES_texture_float");
+    if (!floatExt) {
+      // Still allow absolute WebGL path without perturbation textures
+      floatExt = null;
     }
-    g.useProgram(prog);
+
+    var vs = compileShader(g, g.VERTEX_SHADER, VERT_SRC);
+    var progAbs = linkProgram(g, vs, FRAG_SRC);
+    var progPert = null;
+    try {
+      progPert = linkProgram(g, vs, FRAG_SRC_PERT);
+    } catch (e) {
+      progPert = null;
+    }
+
+    g.useProgram(progAbs);
 
     var buf = g.createBuffer();
     g.bindBuffer(g.ARRAY_BUFFER, buf);
-    // full-screen triangle strip (two triangles as clip-space quad)
     g.bufferData(
       g.ARRAY_BUFFER,
       new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
       g.STATIC_DRAW
     );
-    var aPos = g.getAttribLocation(prog, "a_pos");
-    g.enableVertexAttribArray(aPos);
-    g.vertexAttribPointer(aPos, 2, g.FLOAT, false, 0, 0);
+    function bindPos(prog) {
+      var aPos = g.getAttribLocation(prog, "a_pos");
+      g.enableVertexAttribArray(aPos);
+      g.vertexAttribPointer(aPos, 2, g.FLOAT, false, 0, 0);
+    }
+    bindPos(progAbs);
 
-    var uniforms = {
-      res: g.getUniformLocation(prog, "u_res"),
-      centerX: g.getUniformLocation(prog, "u_centerX"),
-      centerY: g.getUniformLocation(prog, "u_centerY"),
-      planeWidth: g.getUniformLocation(prog, "u_planeWidth"),
-      maxIter: g.getUniformLocation(prog, "u_maxIter")
+    var uniformsAbs = {
+      res: g.getUniformLocation(progAbs, "u_res"),
+      centerX: g.getUniformLocation(progAbs, "u_centerX"),
+      centerY: g.getUniformLocation(progAbs, "u_centerY"),
+      planeWidth: g.getUniformLocation(progAbs, "u_planeWidth"),
+      maxIter: g.getUniformLocation(progAbs, "u_maxIter")
     };
+
+    var uniformsPert = null;
+    var orbitTex = null;
+    if (progPert) {
+      g.useProgram(progPert);
+      bindPos(progPert);
+      uniformsPert = {
+        res: g.getUniformLocation(progPert, "u_res"),
+        planeWidth: g.getUniformLocation(progPert, "u_planeWidth"),
+        aspect: g.getUniformLocation(progPert, "u_aspect"),
+        maxIter: g.getUniformLocation(progPert, "u_maxIter"),
+        orbitLen: g.getUniformLocation(progPert, "u_orbitLen"),
+        orbit: g.getUniformLocation(progPert, "u_orbit")
+      };
+      orbitTex = g.createTexture();
+      g.bindTexture(g.TEXTURE_2D, orbitTex);
+      g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);
+      g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);
+      g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
+      g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
+    }
 
     g.disable(g.DEPTH_TEST);
     g.disable(g.BLEND);
+    g.useProgram(progAbs);
 
-    return { gl: g, program: prog, uniforms: uniforms };
+    return {
+      gl: g,
+      program: progAbs,
+      programPert: progPert,
+      uniforms: uniformsAbs,
+      uniformsPert: uniformsPert,
+      orbitTex: orbitTex,
+      floatTex: !!floatExt,
+      bindPos: bindPos
+    };
+  }
+
+  function applyWebGLState(webgl) {
+    gl = webgl.gl;
+    glProgram = webgl.program;
+    glProgramPert = webgl.programPert;
+    glUniforms = webgl.uniforms;
+    glUniformsPert = webgl.uniformsPert;
+    glOrbitTex = webgl.orbitTex;
+    glFloatTex = webgl.floatTex;
+    glBindPos = webgl.bindPos;
   }
 
   function ensureWebGL() {
     if (!webglAvailable) return false;
-    // Setting glCanvas.width/height resets the WebGL context; rebuild if needed.
     if (!gl || gl.isContextLost()) {
       var webgl = initWebGL(glCanvas);
       if (!webgl) {
         webglAvailable = false;
         return false;
       }
-      gl = webgl.gl;
-      glProgram = webgl.program;
-      glUniforms = webgl.uniforms;
+      applyWebGLState(webgl);
       return true;
     }
     if (!glProgram || !gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
@@ -543,39 +880,93 @@
         webglAvailable = false;
         return false;
       }
-      gl = rebuilt.gl;
-      glProgram = rebuilt.program;
-      glUniforms = rebuilt.uniforms;
+      applyWebGLState(rebuilt);
     }
     return true;
   }
 
   function blitGlToDisplay() {
-    // Copy offscreen WebGL buffer onto the visible 2d canvas
     ctx2d.setTransform(1, 0, 0, 1, 0, 0);
     ctx2d.drawImage(glCanvas, 0, 0, imgW, imgH, 0, 0, imgW, imgH);
   }
 
+  function getCachedOrbit(cx, cy, mi) {
+    var key = cx + "|" + cy + "|" + mi;
+    if (orbitCache.key === key && orbitCache.orbit) return orbitCache.orbit;
+    var orbit = buildReferenceOrbit(cx, cy, mi);
+    orbitCache = { key: key, orbit: orbit };
+    return orbit;
+  }
+
+  function uploadOrbitTexture(orbit) {
+    if (!gl || !glOrbitTex || !glFloatTex) return false;
+    var n = orbit.len;
+    var data = new Float32Array(n * 4);
+    for (var i = 0; i < n; i++) {
+      data[i * 4] = orbit.zRe[i];
+      data[i * 4 + 1] = orbit.zIm[i];
+      data[i * 4 + 2] = orbit.zRe[i] * orbit.zRe[i] + orbit.zIm[i] * orbit.zIm[i];
+      data[i * 4 + 3] = 1;
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, glOrbitTex);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, n, 1, 0, gl.RGBA, gl.FLOAT, data
+    );
+    return true;
+  }
+
   function paintWebGL(sync) {
     if (!ensureWebGL()) {
-      // Transient GL failure: paint this frame on CPU without forcing backend
       if (!imageData) imageData = ctx2d.createImageData(imgW, imgH);
-      paintCpuFullFrame(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
+      paintCpuDeepOrShallow(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
       ctx2d.putImageData(imageData, 0, 0);
       return false;
     }
     var g = gl;
     g.viewport(0, 0, imgW, imgH);
-    g.useProgram(glProgram);
-    g.uniform2f(glUniforms.res, imgW, imgH);
-    var cx = splitDouble(view.centerX);
-    var cy = splitDouble(view.centerY);
-    var pw = splitDouble(view.planeWidth);
-    g.uniform2f(glUniforms.centerX, cx.hi, cx.lo);
-    g.uniform2f(glUniforms.centerY, cy.hi, cy.lo);
-    g.uniform2f(glUniforms.planeWidth, pw.hi, pw.lo);
-    g.uniform1f(glUniforms.maxIter, maxIter);
-    g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
+    var usePert =
+      shouldUsePerturbation(view.planeWidth) &&
+      glProgramPert &&
+      glFloatTex &&
+      glUniformsPert;
+
+    if (usePert) {
+      paintMode = "perturb";
+      var orbit = getCachedOrbit(view.centerX, view.centerY, maxIter);
+      if (!uploadOrbitTexture(orbit)) {
+        // Fall back to CPU perturbation for this frame
+        if (!imageData) imageData = ctx2d.createImageData(imgW, imgH);
+        paintCpuPerturbFullFrame(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
+        ctx2d.putImageData(imageData, 0, 0);
+        return true;
+      }
+      g.useProgram(glProgramPert);
+      if (glBindPos) glBindPos(glProgramPert);
+      g.uniform2f(glUniformsPert.res, imgW, imgH);
+      var pw = splitDouble(view.planeWidth);
+      g.uniform2f(glUniformsPert.planeWidth, pw.hi, pw.lo);
+      g.uniform1f(glUniformsPert.aspect, imgW / imgH);
+      g.uniform1f(glUniformsPert.maxIter, maxIter);
+      g.uniform1f(glUniformsPert.orbitLen, orbit.len);
+      g.uniform1i(glUniformsPert.orbit, 0);
+      g.activeTexture(g.TEXTURE0);
+      g.bindTexture(g.TEXTURE_2D, glOrbitTex);
+      g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
+    } else {
+      paintMode = "absolute";
+      g.useProgram(glProgram);
+      if (glBindPos) glBindPos(glProgram);
+      g.uniform2f(glUniforms.res, imgW, imgH);
+      var cx = splitDouble(view.centerX);
+      var cy = splitDouble(view.centerY);
+      var pw2 = splitDouble(view.planeWidth);
+      g.uniform2f(glUniforms.centerX, cx.hi, cx.lo);
+      g.uniform2f(glUniforms.centerY, cy.hi, cy.lo);
+      g.uniform2f(glUniforms.planeWidth, pw2.hi, pw2.lo);
+      g.uniform1f(glUniforms.maxIter, maxIter);
+      g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
+    }
     if (sync) {
       g.finish();
       var probe = new Uint8Array(4);
@@ -583,6 +974,15 @@
     }
     blitGlToDisplay();
     return true;
+  }
+
+  function paintCpuDeepOrShallow(w, h, centerX, centerY, planeWidth, maxIter, out) {
+    if (shouldUsePerturbation(planeWidth)) {
+      paintMode = "perturb";
+      return paintCpuPerturbFullFrame(w, h, centerX, centerY, planeWidth, maxIter, out).data;
+    }
+    paintMode = "absolute";
+    return paintCpuFullFrame(w, h, centerX, centerY, planeWidth, maxIter, out);
   }
 
   function updateBackendButtons() {
@@ -629,6 +1029,19 @@
     var data = imageData.data;
     var w = imgW, h = imgH;
     var cx = view.centerX, cy = view.centerY, pw = view.planeWidth;
+
+    // Deep zoom: full-frame perturbation (reference once, then δ per pixel)
+    if (shouldUsePerturbation(pw)) {
+      paintMode = "perturb";
+      paintCpuPerturbFullFrame(w, h, cx, cy, pw, maxIter, data);
+      if (token !== renderToken) return;
+      ctx2d.putImageData(imageData, 0, 0);
+      rendering = false;
+      updateHud();
+      return;
+    }
+
+    paintMode = "absolute";
     var aspect = w / h;
     var ph = pw / aspect;
     var re0 = cx - pw / 2;
@@ -670,9 +1083,8 @@
       updateHud();
       return;
     }
-    // CPU fallback: chunked unless sync (perf / forced full frame)
     if (sync) {
-      paintCpuFullFrame(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
+      paintCpuDeepOrShallow(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
       ctx2d.putImageData(imageData, 0, 0);
       rendering = false;
       updateHud();
@@ -698,7 +1110,10 @@
       // Offscreen GL resize resets the context
       gl = null;
       glProgram = null;
+      glProgramPert = null;
       glUniforms = null;
+      glUniformsPert = null;
+      glOrbitTex = null;
       if (backend === "webgl") ensureWebGL();
     }
     canvas.style.width = cssW + "px";
@@ -714,7 +1129,12 @@
       : zoom >= 1000
         ? zoom.toFixed(0)
         : zoom.toFixed(2);
-    var backendLabel = backend === "webgl" ? "webgl (ds)" : backend === "cpu" ? "cpu f64" : backend;
+    var backendLabel =
+      backend === "webgl"
+        ? (paintMode === "perturb" ? "webgl pert" : "webgl (ds)")
+        : backend === "cpu"
+          ? (paintMode === "perturb" ? "cpu pert" : "cpu f64")
+          : backend;
     infoEl.textContent =
       "zoom ×" + zoomStr +
       "\niter " + maxIter +
@@ -744,9 +1164,7 @@
   try {
     var webglInit = initWebGL(glCanvas);
     if (webglInit) {
-      gl = webglInit.gl;
-      glProgram = webglInit.program;
-      glUniforms = webglInit.uniforms;
+      applyWebGLState(webglInit);
       webglAvailable = true;
       backend = "webgl";
     }
@@ -813,7 +1231,10 @@
         glCanvas.height = h;
         gl = null;
         glProgram = null;
+        glProgramPert = null;
         glUniforms = null;
+        glUniformsPert = null;
+        glOrbitTex = null;
       }
 
       imageData = ctx2d.createImageData(w, h);
@@ -825,7 +1246,7 @@
         paintWebGL(true);
         usedBackend = "webgl";
       } else {
-        paintCpuFullFrame(w, h, cx, cy, pw, mi, imageData.data);
+        paintCpuDeepOrShallow(w, h, cx, cy, pw, mi, imageData.data);
         ctx2d.putImageData(imageData, 0, 0);
         usedBackend = "cpu";
       }
@@ -845,13 +1266,16 @@
         glCanvas.height = prev.h;
         gl = null;
         glProgram = null;
+        glProgramPert = null;
         glUniforms = null;
+        glUniformsPert = null;
+        glOrbitTex = null;
         if (backend === "webgl") ensureWebGL();
       }
       imageData = ctx2d.createImageData(prev.w, prev.h);
       dirty = true;
 
-      return { ms: t1 - t0, backend: usedBackend, w: w, h: h, maxIter: mi };
+      return { ms: t1 - t0, backend: usedBackend, w: w, h: h, maxIter: mi, mode: paintMode };
     },
     /** Always times the shipped CPU full-frame path (baseline reference). */
     paintCpuFullFrameSync: function (opts) {
@@ -924,14 +1348,17 @@
       glCanvas.height = h;
       gl = null;
       glProgram = null;
+      glProgramPert = null;
       glUniforms = null;
+      glUniformsPert = null;
+      glOrbitTex = null;
       imageData = ctx2d.createImageData(w, h);
       if (backend === "webgl") ensureWebGL();
 
       if (backend === "webgl" && ensureWebGL()) {
         paintWebGL(true);
       } else {
-        paintCpuFullFrame(w, h, cx, cy, pw, mi, imageData.data);
+        paintCpuDeepOrShallow(w, h, cx, cy, pw, mi, imageData.data);
         ctx2d.putImageData(imageData, 0, 0);
       }
 
@@ -943,6 +1370,7 @@
         dataUrl = null;
       }
       metrics.dataUrl = dataUrl;
+      metrics.mode = paintMode;
 
       imgW = prev.w;
       imgH = prev.h;
@@ -956,7 +1384,10 @@
       glCanvas.height = prev.h;
       gl = null;
       glProgram = null;
+      glProgramPert = null;
       glUniforms = null;
+      glUniformsPert = null;
+      glOrbitTex = null;
       imageData = ctx2d.createImageData(prev.w, prev.h);
       if (backend === "webgl") ensureWebGL();
       dirty = true;
