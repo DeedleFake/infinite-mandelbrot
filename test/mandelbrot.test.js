@@ -36,7 +36,15 @@ function loadShippedMath() {
     style: {},
     addEventListener: noop,
     setPointerCapture: noop,
-    classList: { add: noop, remove: noop },
+    classList: {
+      add: noop,
+      remove: noop,
+      toggle: noop,
+      contains: () => false
+    },
+    setAttribute: noop,
+    getAttribute: () => null,
+    disabled: false,
     getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 600 }),
     width: 800,
     height: 600,
@@ -63,7 +71,20 @@ function loadShippedMath() {
       addEventListener: noop
     },
     document: {
-      getElementById: () => el
+      getElementById: () => el,
+      createElement: (tag) => {
+        if (tag === "canvas") {
+          return {
+            getContext: (type) => {
+              if (type === "webgl" || type === "experimental-webgl") return null;
+              return ctx2d;
+            },
+            width: 800,
+            height: 600
+          };
+        }
+        return { style: {} };
+      }
     }
   };
   sandbox.globalThis = sandbox;
@@ -387,11 +408,11 @@ test("splitDouble preserves distinct deep pixel offsets after reconstruct", () =
   assert.ok(set.size >= 60, "reconstructed unique re=" + set.size);
 });
 
-test("minimal chrome: reset control only (sparse UI)", () => {
+test("minimal chrome: sparse controls (renderer + reset)", () => {
   assert.ok(/btn-reset|Reset/.test(html));
-  // No cluttered toolbar of many buttons
+  assert.ok(/btn-webgl|btn-cpu|setBackend/.test(html));
   const buttons = html.match(/<button\b/gi) || [];
-  assert.ok(buttons.length <= 3, "too many buttons: " + buttons.length);
+  assert.ok(buttons.length <= 5, "too many buttons: " + buttons.length);
 });
 
 if (process.exitCode) {

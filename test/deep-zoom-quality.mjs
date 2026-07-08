@@ -47,7 +47,10 @@ function loadCpuPaint() {
     style: {},
     addEventListener: noop,
     setPointerCapture: noop,
-    classList: { add: noop, remove: noop },
+    classList: { add: noop, remove: noop, toggle: noop, contains: () => false },
+    setAttribute: noop,
+    getAttribute: () => null,
+    disabled: false,
     getBoundingClientRect: () => ({ left: 0, top: 0, width: 320, height: 240 }),
     width: 320,
     height: 240,
@@ -71,7 +74,20 @@ function loadCpuPaint() {
       innerHeight: 240,
       addEventListener: noop
     },
-    document: { getElementById: () => el }
+    document: {
+      getElementById: () => el,
+      createElement: (tag) => {
+        if (tag === "canvas") {
+          return {
+            getContext: (type) =>
+              type === "webgl" || type === "experimental-webgl" ? null : ctx2d,
+            width: 320,
+            height: 240
+          };
+        }
+        return { style: {} };
+      }
+    }
   };
   sandbox.globalThis = sandbox;
   vm.runInNewContext(script, sandbox, { filename: "index.html" });

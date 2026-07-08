@@ -87,6 +87,14 @@
     button:active {
       background: rgba(50, 50, 60, 0.9);
     }
+    button.active-backend {
+      border-color: rgba(140, 170, 255, 0.55);
+      background: rgba(40, 48, 72, 0.88);
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body>
@@ -95,6 +103,8 @@
   <div id="hud">
     <div id="info"></div>
     <div id="actions">
+      <button type="button" id="btn-webgl" title="GPU / emulated-double renderer">WebGL</button>
+      <button type="button" id="btn-cpu" title="CPU float64 renderer">CPU</button>
       <button type="button" id="btn-reset" title="Reset view">Reset</button>
     </div>
   </div>
@@ -324,22 +334,28 @@
     return Math.min(4096, Math.floor(base + depth * 48));
   }
 
-  // ── Renderer: WebGL (primary) + Canvas2D CPU (fallback) ────────────────
+  // ── Renderer: WebGL (offscreen) + Canvas2D display / CPU ───────────────
+  // Display canvas is always 2d so backends can switch without losing view.
+  // WebGL draws to an offscreen canvas, then blits onto #c.
 
   var canvas = document.getElementById("c");
   var infoEl = document.getElementById("info");
+  var btnWebgl = document.getElementById("btn-webgl");
+  var btnCpu = document.getElementById("btn-cpu");
   var dpr = 1;
   var imgW = 0, imgH = 0;
   var dirty = true;
   var rendering = false;
   var renderToken = 0;
   var backend = "none";
+  var webglAvailable = false;
 
-  // CPU state
-  var ctx2d = null;
+  // Display + CPU state (always on #c)
+  var ctx2d = canvas.getContext("2d", { alpha: false });
   var imageData = null;
 
-  // WebGL state
+  // Offscreen WebGL canvas (never attached to DOM)
+  var glCanvas = document.createElement("canvas");
   var gl = null;
   var glProgram = null;
   var glUniforms = null;
@@ -508,27 +524,23 @@
   }
 
   function ensureWebGL() {
-    // Setting canvas.width/height resets the WebGL context; rebuild if needed.
+    if (!webglAvailable) return false;
+    // Setting glCanvas.width/height resets the WebGL context; rebuild if needed.
     if (!gl || gl.isContextLost()) {
-      var webgl = initWebGL(canvas);
+      var webgl = initWebGL(glCanvas);
       if (!webgl) {
-        backend = "cpu";
-        if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
+        webglAvailable = false;
         return false;
       }
       gl = webgl.gl;
       glProgram = webgl.program;
       glUniforms = webgl.uniforms;
-      backend = "webgl";
       return true;
     }
-    // Context exists but programs may be wiped after a canvas size change.
-    // Detect by checking the program is still valid.
     if (!glProgram || !gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
-      var rebuilt = initWebGL(canvas);
+      var rebuilt = initWebGL(glCanvas);
       if (!rebuilt) {
-        backend = "cpu";
-        if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
+        webglAvailable = false;
         return false;
       }
       gl = rebuilt.gl;
@@ -538,13 +550,19 @@
     return true;
   }
 
+  function blitGlToDisplay() {
+    // Copy offscreen WebGL buffer onto the visible 2d canvas
+    ctx2d.setTransform(1, 0, 0, 1, 0, 0);
+    ctx2d.drawImage(glCanvas, 0, 0, imgW, imgH, 0, 0, imgW, imgH);
+  }
+
   function paintWebGL(sync) {
     if (!ensureWebGL()) {
-      // Fall back mid-flight
-      if (!imageData && ctx2d) imageData = ctx2d.createImageData(imgW, imgH);
+      // Transient GL failure: paint this frame on CPU without forcing backend
+      if (!imageData) imageData = ctx2d.createImageData(imgW, imgH);
       paintCpuFullFrame(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
       ctx2d.putImageData(imageData, 0, 0);
-      return;
+      return false;
     }
     var g = gl;
     g.viewport(0, 0, imgW, imgH);
@@ -559,11 +577,51 @@
     g.uniform1f(glUniforms.maxIter, maxIter);
     g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
     if (sync) {
-      // Force GPU completion: finish + 1px readback (some drivers treat finish as a no-op hint)
       g.finish();
       var probe = new Uint8Array(4);
       g.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, probe);
     }
+    blitGlToDisplay();
+    return true;
+  }
+
+  function updateBackendButtons() {
+    if (!btnWebgl || !btnCpu) return;
+    btnWebgl.disabled = !webglAvailable;
+    btnWebgl.classList.toggle("active-backend", backend === "webgl");
+    btnCpu.classList.toggle("active-backend", backend === "cpu");
+    btnWebgl.setAttribute("aria-pressed", backend === "webgl" ? "true" : "false");
+    btnCpu.setAttribute("aria-pressed", backend === "cpu" ? "true" : "false");
+  }
+
+  /**
+   * Switch paint backend without changing pan/zoom. Same view is re-rendered.
+   * @param {"webgl"|"cpu"} name
+   * @returns {boolean} whether the backend is now active
+   */
+  function setBackend(name) {
+    if (name === "webgl") {
+      if (!webglAvailable && !ensureWebGL()) {
+        updateBackendButtons();
+        return false;
+      }
+      webglAvailable = true;
+      backend = "webgl";
+    } else if (name === "cpu") {
+      backend = "cpu";
+      if (!imageData || imageData.width !== imgW || imageData.height !== imgH) {
+        imageData = ctx2d.createImageData(imgW, imgH);
+      }
+    } else {
+      return false;
+    }
+    // Cancel in-flight CPU chunked paint; re-draw current view on new backend
+    renderToken++;
+    rendering = false;
+    dirty = true;
+    updateBackendButtons();
+    updateHud();
+    return true;
   }
 
   function paintCpuChunked(token) {
@@ -635,19 +693,17 @@
     if (sizeChanged || canvas.width !== imgW || canvas.height !== imgH) {
       canvas.width = imgW;
       canvas.height = imgH;
-      // Canvas resize resets WebGL; rebuild programs/buffers
-      if (backend === "webgl") {
-        gl = null;
-        glProgram = null;
-        glUniforms = null;
-        ensureWebGL();
-      }
+      glCanvas.width = imgW;
+      glCanvas.height = imgH;
+      // Offscreen GL resize resets the context
+      gl = null;
+      glProgram = null;
+      glUniforms = null;
+      if (backend === "webgl") ensureWebGL();
     }
     canvas.style.width = cssW + "px";
     canvas.style.height = cssH + "px";
-    if (backend === "cpu" && ctx2d) {
-      imageData = ctx2d.createImageData(imgW, imgH);
-    }
+    imageData = ctx2d.createImageData(imgW, imgH);
     dirty = true;
   }
 
@@ -658,10 +714,12 @@
       : zoom >= 1000
         ? zoom.toFixed(0)
         : zoom.toFixed(2);
+    var backendLabel = backend === "webgl" ? "webgl (ds)" : backend === "cpu" ? "cpu f64" : backend;
     infoEl.textContent =
       "zoom ×" + zoomStr +
       "\niter " + maxIter +
-      "\n" + view.centerX.toPrecision(8) + " + " + view.centerY.toPrecision(8) + "i";
+      "\n" + view.centerX.toPrecision(8) + " + " + view.centerY.toPrecision(8) + "i" +
+      "\n" + backendLabel;
   }
 
   function requestRender() {
@@ -679,31 +737,33 @@
     requestAnimationFrame(frame);
   }
 
-  // Init backend: prefer WebGL
+  // Init: display is always 2d; WebGL is optional offscreen
+  if (!ctx2d) {
+    infoEl.textContent = "No canvas rendering available.";
+  }
   try {
-    var webgl = initWebGL(canvas);
-    if (webgl) {
-      gl = webgl.gl;
-      glProgram = webgl.program;
-      glUniforms = webgl.uniforms;
+    var webglInit = initWebGL(glCanvas);
+    if (webglInit) {
+      gl = webglInit.gl;
+      glProgram = webglInit.program;
+      glUniforms = webglInit.uniforms;
+      webglAvailable = true;
       backend = "webgl";
     }
   } catch (e) {
-    backend = "none";
+    webglAvailable = false;
     gl = null;
   }
-  if (backend !== "webgl") {
-    ctx2d = canvas.getContext("2d", { alpha: false });
-    if (!ctx2d) {
-      infoEl.textContent = "No canvas rendering available.";
-    } else {
-      backend = "cpu";
-    }
+  if (!webglAvailable) {
+    backend = "cpu";
   }
+  updateBackendButtons();
 
   // Perf / test surface: drive shipped paint paths without re-implementing math
   var MandelbrotApp = {
     getBackend: function () { return backend; },
+    isWebglAvailable: function () { return webglAvailable; },
+    setBackend: setBackend,
     getSize: function () { return { w: imgW, h: imgH }; },
     getView: function () {
       return {
@@ -749,30 +809,22 @@
       if (sizeChanged) {
         canvas.width = w;
         canvas.height = h;
-        if (backend === "webgl" || gl) {
-          gl = null;
-          glProgram = null;
-          glUniforms = null;
-        }
+        glCanvas.width = w;
+        glCanvas.height = h;
+        gl = null;
+        glProgram = null;
+        glUniforms = null;
       }
 
-      if (backend === "cpu" || (!gl && backend !== "webgl")) {
-        if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
-        if (ctx2d) imageData = ctx2d.createImageData(w, h);
-      }
-
-      // Rebuild GL after size change before timing the actual paint
-      if (backend === "webgl") {
-        ensureWebGL();
-      }
+      imageData = ctx2d.createImageData(w, h);
+      if (backend === "webgl") ensureWebGL();
 
       var usedBackend = backend;
       var t0 = performance.now();
-      if (backend === "webgl" && gl) {
+      if (backend === "webgl" && ensureWebGL()) {
         paintWebGL(true);
         usedBackend = "webgl";
       } else {
-        if (!imageData && ctx2d) imageData = ctx2d.createImageData(w, h);
         paintCpuFullFrame(w, h, cx, cy, pw, mi, imageData.data);
         ctx2d.putImageData(imageData, 0, 0);
         usedBackend = "cpu";
@@ -789,16 +841,14 @@
       if (sizeChanged) {
         canvas.width = prev.w;
         canvas.height = prev.h;
-        if (backend === "webgl") {
-          gl = null;
-          glProgram = null;
-          glUniforms = null;
-          ensureWebGL();
-        }
+        glCanvas.width = prev.w;
+        glCanvas.height = prev.h;
+        gl = null;
+        glProgram = null;
+        glUniforms = null;
+        if (backend === "webgl") ensureWebGL();
       }
-      if (backend === "cpu" && ctx2d) {
-        imageData = ctx2d.createImageData(prev.w, prev.h);
-      }
+      imageData = ctx2d.createImageData(prev.w, prev.h);
       dirty = true;
 
       return { ms: t1 - t0, backend: usedBackend, w: w, h: h, maxIter: mi };
@@ -824,15 +874,9 @@
     sampleUniqueColors: function (step) {
       step = step || 8;
       var w = imgW, h = imgH;
-      var pixels;
-      if (backend === "webgl" && gl) {
-        pixels = new Uint8Array(w * h * 4);
-        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-      } else if (ctx2d) {
-        pixels = ctx2d.getImageData(0, 0, w, h).data;
-      } else {
-        return { unique: 0, samples: 0, backend: backend };
-      }
+      // Always sample the display canvas (WebGL frames are blitted there)
+      if (!ctx2d) return { unique: 0, samples: 0, backend: backend };
+      var pixels = ctx2d.getImageData(0, 0, w, h).data;
       var set = {};
       var count = 0;
       var unique = 0;
@@ -876,19 +920,17 @@
       maxIter = mi;
       canvas.width = w;
       canvas.height = h;
-      if (backend === "webgl") {
-        gl = null;
-        glProgram = null;
-        glUniforms = null;
-        ensureWebGL();
-      } else if (ctx2d) {
-        imageData = ctx2d.createImageData(w, h);
-      }
+      glCanvas.width = w;
+      glCanvas.height = h;
+      gl = null;
+      glProgram = null;
+      glUniforms = null;
+      imageData = ctx2d.createImageData(w, h);
+      if (backend === "webgl") ensureWebGL();
 
-      if (backend === "webgl" && gl) {
+      if (backend === "webgl" && ensureWebGL()) {
         paintWebGL(true);
       } else {
-        if (!imageData && ctx2d) imageData = ctx2d.createImageData(w, h);
         paintCpuFullFrame(w, h, cx, cy, pw, mi, imageData.data);
         ctx2d.putImageData(imageData, 0, 0);
       }
@@ -910,14 +952,13 @@
       maxIter = prev.mi;
       canvas.width = prev.w;
       canvas.height = prev.h;
-      if (backend === "webgl") {
-        gl = null;
-        glProgram = null;
-        glUniforms = null;
-        ensureWebGL();
-      } else if (ctx2d) {
-        imageData = ctx2d.createImageData(prev.w, prev.h);
-      }
+      glCanvas.width = prev.w;
+      glCanvas.height = prev.h;
+      gl = null;
+      glProgram = null;
+      glUniforms = null;
+      imageData = ctx2d.createImageData(prev.w, prev.h);
+      if (backend === "webgl") ensureWebGL();
       dirty = true;
       return metrics;
     }
@@ -1114,6 +1155,28 @@
     requestRender();
   });
 
+  if (btnWebgl) {
+    btnWebgl.addEventListener("click", function () {
+      setBackend("webgl");
+    });
+  }
+  if (btnCpu) {
+    btnCpu.addEventListener("click", function () {
+      setBackend("cpu");
+    });
+  }
+
+  // Keyboard: B cycles backend (WebGL ↔ CPU) without moving the view
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Control") return; // handled elsewhere
+    if (e.key === "b" || e.key === "B") {
+      if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+      e.preventDefault();
+      if (backend === "webgl") setBackend("cpu");
+      else setBackend("webgl");
+    }
+  });
+
   window.addEventListener("resize", function () {
     resize();
     requestRender();
@@ -1121,6 +1184,7 @@
 
   resize();
   updateHud();
+  updateBackendButtons();
   requestAnimationFrame(frame);
 })();
   </script>

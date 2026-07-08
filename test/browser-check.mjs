@@ -72,16 +72,9 @@ async function main() {
       const backend =
         (globalThis.MandelbrotApp && globalThis.MandelbrotApp.getBackend()) ||
         "unknown";
-      let sample;
-      if (backend === "webgl") {
-        const gl =
-          c.getContext("webgl") || c.getContext("experimental-webgl");
-        sample = new Uint8Array(w * h * 4);
-        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, sample);
-      } else {
-        const ctx = c.getContext("2d");
-        sample = ctx.getImageData(0, 0, w, h).data;
-      }
+      // Display canvas is always 2d; WebGL frames are blitted onto it
+      const ctx = c.getContext("2d");
+      const sample = ctx.getImageData(0, 0, w, h).data;
       let nonBlack = 0;
       let nonEmpty = 0;
       const step = 16; // sample every Nth pixel for speed
@@ -134,7 +127,7 @@ async function main() {
         "surface mostly blank; nonBlackFrac=" + metrics.nonBlackFrac
       );
     }
-    if (metrics.hudButtons > 3) {
+    if (metrics.hudButtons > 5) {
       throw new Error("UI not sparse: " + metrics.hudButtons + " buttons");
     }
 
@@ -152,15 +145,7 @@ async function main() {
         "unknown";
       const sw = Math.min(64, c.width);
       const sh = Math.min(64, c.height);
-      let d;
-      if (backend === "webgl") {
-        const gl =
-          c.getContext("webgl") || c.getContext("experimental-webgl");
-        d = new Uint8Array(sw * sh * 4);
-        gl.readPixels(0, 0, sw, sh, gl.RGBA, gl.UNSIGNED_BYTE, d);
-      } else {
-        d = c.getContext("2d").getImageData(0, 0, sw, sh).data;
-      }
+      const d = c.getContext("2d").getImageData(0, 0, sw, sh).data;
       return {
         info: document.getElementById("info").textContent,
         hash: Array.from(d).reduce((a, b) => (a * 31 + b) | 0, 0),
