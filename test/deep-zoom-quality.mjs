@@ -164,15 +164,23 @@ async function main() {
 
   const live = await page.evaluate((deep) => {
     const app = globalThis.MandelbrotApp;
-    const backend = app.getBackend();
     const q = app.deepZoomQuality(deep);
-    return { backend, ...q };
+    return q;
   }, DEEP);
 
-  await page.screenshot({
-    path: join(SCRATCH, "deep-zoom.png"),
-    fullPage: true
-  });
+  if (live.dataUrl && live.dataUrl.startsWith("data:image/png")) {
+    const b64 = live.dataUrl.replace(/^data:image\/png;base64,/, "");
+    writeFileSync(join(SCRATCH, "deep-zoom.png"), Buffer.from(b64, "base64"));
+  } else {
+    await page.screenshot({
+      path: join(SCRATCH, "deep-zoom.png"),
+      fullPage: true
+    });
+  }
+  const dataUrl = live.dataUrl;
+  delete live.dataUrl;
+  live.backend = live.backend || "unknown";
+  void dataUrl;
 
   const report = {
     case: DEEP,

@@ -894,6 +894,13 @@
       }
 
       var metrics = this.sampleUniqueColors(step);
+      var dataUrl = null;
+      try {
+        dataUrl = canvas.toDataURL("image/png");
+      } catch (e) {
+        dataUrl = null;
+      }
+      metrics.dataUrl = dataUrl;
 
       imgW = prev.w;
       imgH = prev.h;
