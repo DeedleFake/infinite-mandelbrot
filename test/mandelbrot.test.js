@@ -19,11 +19,20 @@ function loadShippedMath() {
   const script = match[1];
 
   const noop = () => {};
-  const el = {
-    getContext: () => ({
-      createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
-      putImageData: noop
+  const ctx2d = {
+    createImageData: (w, h) => ({
+      data: new Uint8ClampedArray(w * h * 4),
+      width: w,
+      height: h
     }),
+    putImageData: noop
+  };
+  const el = {
+    // Prefer failing WebGL so Node tests exercise math + CPU fallback cleanly
+    getContext: (type) => {
+      if (type === "webgl" || type === "experimental-webgl") return null;
+      return ctx2d;
+    },
     style: {},
     addEventListener: noop,
     setPointerCapture: noop,
@@ -42,7 +51,9 @@ function loadShippedMath() {
     Map,
     Array,
     Object,
+    Float32Array,
     Uint8ClampedArray,
+    performance: { now: () => Date.now() },
     requestAnimationFrame: noop,
     globalThis: null,
     window: {
@@ -278,6 +289,26 @@ test("ctrl marquee zoom bindings present", () => {
   assert.ok(/ctrlKey/.test(html));
   assert.ok(/zoomToRect/.test(html));
   assert.ok(/marquee/.test(html));
+});
+
+test("WebGL paint path + CPU fallback present", () => {
+  assert.ok(/getContext\(\s*["']webgl["']/.test(html));
+  assert.ok(/paintCpuFullFrame/.test(html));
+  assert.ok(/FRAGMENT_SHADER|fragment/i.test(html));
+  assert.ok(/MandelbrotApp/.test(html));
+});
+
+test("shipped paintCpuFullFrame produces filled buffer", () => {
+  assert.strictEqual(typeof M.paintCpuFullFrame, "function");
+  const w = 32,
+    h = 24;
+  const buf = M.paintCpuFullFrame(w, h, -0.5, 0, 3.5, 64);
+  assert.strictEqual(buf.length, w * h * 4);
+  let nonBlack = 0;
+  for (let i = 0; i < buf.length; i += 4) {
+    if (buf[i] + buf[i + 1] + buf[i + 2] > 40) nonBlack++;
+  }
+  assert.ok(nonBlack > w * h * 0.1, "expected exterior colors, nonBlack=" + nonBlack);
 });
 
 test("minimal chrome: reset control only (sparse UI)", () => {

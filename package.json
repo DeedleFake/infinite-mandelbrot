@@ -5,7 +5,8 @@
   "description": "Single-file infinitely zoomable Mandelbrot viewer",
   "scripts": {
     "test": "node test/mandelbrot.test.js",
-    "test:browser": "node test/browser-check.mjs"
+    "test:browser": "node test/browser-check.mjs",
+    "test:perf": "node test/perf.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.61.1"

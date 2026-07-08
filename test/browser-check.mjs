@@ -11,7 +11,7 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const SCRATCH =
-  process.env.SCRATCH || "/tmp/grok-goal-adf2aef02c52/implementer";
+  process.env.SCRATCH || "/tmp/grok-goal-70878daad40d/implementer";
 const HTML = readFileSync(join(ROOT, "index.html"));
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -34,7 +34,13 @@ async function main() {
     browser = await chromium.launch({
       executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium",
       headless: true,
-      args: ["--no-sandbox", "--disable-gpu"]
+      args: [
+        "--no-sandbox",
+        "--enable-webgl",
+        "--ignore-gpu-blocklist",
+        "--use-gl=angle",
+        "--use-angle=swiftshader-webgl"
+      ]
     });
   } catch (e) {
     const msg = "browser launch failed: " + e.message;
@@ -61,23 +67,38 @@ async function main() {
     const metrics = await page.evaluate(() => {
       const c = document.getElementById("c");
       if (!c) return { error: "no canvas" };
-      const ctx = c.getContext("2d");
       const w = c.width;
       const h = c.height;
-      const sample = ctx.getImageData(0, 0, w, h).data;
+      const backend =
+        (globalThis.MandelbrotApp && globalThis.MandelbrotApp.getBackend()) ||
+        "unknown";
+      let sample;
+      if (backend === "webgl") {
+        const gl =
+          c.getContext("webgl") || c.getContext("experimental-webgl");
+        sample = new Uint8Array(w * h * 4);
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, sample);
+      } else {
+        const ctx = c.getContext("2d");
+        sample = ctx.getImageData(0, 0, w, h).data;
+      }
       let nonBlack = 0;
       let nonEmpty = 0;
       const step = 16; // sample every Nth pixel for speed
       let total = 0;
       for (let i = 0; i < sample.length; i += 4 * step) {
         total++;
-        const r = sample[i], g = sample[i + 1], b = sample[i + 2], a = sample[i + 3];
+        const r = sample[i],
+          g = sample[i + 1],
+          b = sample[i + 2],
+          a = sample[i + 3];
         if (a > 0) nonEmpty++;
         // interior is ~8,8,12 — count clearly colored exterior pixels
         if (r + g + b > 40) nonBlack++;
       }
       const info = document.getElementById("info");
       return {
+        backend,
         width: w,
         height: h,
         cssW: c.clientWidth,
@@ -123,34 +144,40 @@ async function main() {
     });
   }
 
+  function sampleCornerHash() {
+    return page.evaluate(() => {
+      const c = document.getElementById("c");
+      const backend =
+        (globalThis.MandelbrotApp && globalThis.MandelbrotApp.getBackend()) ||
+        "unknown";
+      const sw = Math.min(64, c.width);
+      const sh = Math.min(64, c.height);
+      let d;
+      if (backend === "webgl") {
+        const gl =
+          c.getContext("webgl") || c.getContext("experimental-webgl");
+        d = new Uint8Array(sw * sh * 4);
+        gl.readPixels(0, 0, sw, sh, gl.RGBA, gl.UNSIGNED_BYTE, d);
+      } else {
+        d = c.getContext("2d").getImageData(0, 0, sw, sh).data;
+      }
+      return {
+        info: document.getElementById("info").textContent,
+        hash: Array.from(d).reduce((a, b) => (a * 31 + b) | 0, 0),
+        backend
+      };
+    });
+  }
+
   // Drive zoom and assert view / pixels change
-  const before = await page.evaluate(() => {
-    const c = document.getElementById("c");
-    const ctx = c.getContext("2d");
-    const d = ctx.getImageData(0, 0, Math.min(64, c.width), Math.min(64, c.height)).data;
-    return {
-      info: document.getElementById("info").textContent,
-      hash: Array.from(d).reduce((a, b) => (a * 31 + b) | 0, 0),
-      view: globalThis.MandelbrotMath
-        ? null
-        : null
-    };
-  });
+  const before = await sampleCornerHash();
 
   // Wheel zoom at center
   await page.mouse.move(480, 320);
   await page.mouse.wheel(0, -400); // zoom in
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(200);
 
-  const after = await page.evaluate(() => {
-    const c = document.getElementById("c");
-    const ctx = c.getContext("2d");
-    const d = ctx.getImageData(0, 0, Math.min(64, c.width), Math.min(64, c.height)).data;
-    return {
-      info: document.getElementById("info").textContent,
-      hash: Array.from(d).reduce((a, b) => (a * 31 + b) | 0, 0)
-    };
-  });
+  const after = await sampleCornerHash();
 
   log("before info: " + before.info.replace(/\n/g, " | "));
   log("after  info: " + after.info.replace(/\n/g, " | "));

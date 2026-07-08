@@ -138,7 +138,6 @@
       i++;
     }
     if (i >= maxIter) return maxIter;
-    // nu = log2(log2(|z|)) continuous correction
     var logZn = Math.log(zx2 + zy2) / 2;
     var nu = Math.log(logZn / Math.LN2) / Math.LN2;
     return i + 1 - nu;
@@ -160,7 +159,6 @@
   function zoomAtPoint(px, py, w, h, centerX, centerY, planeWidth, factor) {
     var before = pixelToComplex(px, py, w, h, centerX, centerY, planeWidth);
     var newWidth = planeWidth * factor;
-    // Keep newWidth in a sane float64 range (no artificial UX cap; only numeric floor)
     if (newWidth < Number.MIN_VALUE * 1e6) newWidth = Number.MIN_VALUE * 1e6;
     if (!isFinite(newWidth) || newWidth > 1e6) newWidth = Math.min(planeWidth * factor, 1e6);
     var after = pixelToComplex(px, py, w, h, centerX, centerY, newWidth);
@@ -185,8 +183,6 @@
   /**
    * Zoom so the axis-aligned pixel rect becomes the new viewport.
    * Fits the selection fully, expanding on the short side to match canvas aspect.
-   * Pixel coords are in the same space as pixelToComplex (device pixels).
-   * Returns null if the rect is too small.
    */
   function zoomToRect(x0, y0, x1, y1, w, h, centerX, centerY, planeWidth) {
     var left = Math.min(x0, x1);
@@ -208,7 +204,6 @@
     var newCenterX = (reMin + reMax) / 2;
     var newCenterY = (imMin + imMax) / 2;
 
-    // planeHeight = planeWidth / (w/h); fit both selW and selH
     var aspect = w / h;
     var newWidth = Math.max(selW, selH * aspect);
     if (newWidth < Number.MIN_VALUE * 1e6) newWidth = Number.MIN_VALUE * 1e6;
@@ -224,14 +219,70 @@
     };
   }
 
-  // Expose pure API for Node tests (no DOM dependency)
+  /** HSL-like palette: interior black, exterior smooth bands. */
+  function colorFor(t, maxIt, out, off) {
+    if (t >= maxIt) {
+      out[off] = 8;
+      out[off + 1] = 8;
+      out[off + 2] = 12;
+      out[off + 3] = 255;
+      return;
+    }
+    var v = t / maxIt;
+    var hue = (0.62 + 4.5 * v) % 1;
+    var sat = 0.72;
+    var lit = 0.12 + 0.55 * Math.pow(v, 0.55);
+    var c = (1 - Math.abs(2 * lit - 1)) * sat;
+    var x = c * (1 - Math.abs((hue * 6) % 2 - 1));
+    var m = lit - c / 2;
+    var r = 0, g = 0, b = 0;
+    var h6 = hue * 6;
+    if (h6 < 1) { r = c; g = x; b = 0; }
+    else if (h6 < 2) { r = x; g = c; b = 0; }
+    else if (h6 < 3) { r = 0; g = c; b = x; }
+    else if (h6 < 4) { r = 0; g = x; b = c; }
+    else if (h6 < 5) { r = x; g = 0; b = c; }
+    else { r = c; g = 0; b = x; }
+    out[off] = Math.round((r + m) * 255);
+    out[off + 1] = Math.round((g + m) * 255);
+    out[off + 2] = Math.round((b + m) * 255);
+    out[off + 3] = 255;
+  }
+
+  /**
+   * Full-frame CPU paint (naive baseline / fallback). Synchronous.
+   * Writes RGBA into out (Uint8ClampedArray length w*h*4) or allocates.
+   */
+  function paintCpuFullFrame(w, h, centerX, centerY, planeWidth, maxIter, out) {
+    var data = out || new Uint8ClampedArray(w * h * 4);
+    var aspect = w / h;
+    var ph = planeWidth / aspect;
+    var re0 = centerX - planeWidth / 2;
+    var im0 = centerY + ph / 2;
+    var dre = planeWidth / w;
+    var dim = -ph / h;
+    for (var y = 0; y < h; y++) {
+      var im = im0 + y * dim;
+      var rowOff = y * w * 4;
+      for (var x = 0; x < w; x++) {
+        var re = re0 + x * dre;
+        var t = mandelbrotSmooth(re, im, maxIter);
+        colorFor(t, maxIter, data, rowOff + x * 4);
+      }
+    }
+    return data;
+  }
+
+  // Expose pure API for Node tests (no DOM dependency for math)
   var MandelbrotMath = {
     mandelbrotEscape: mandelbrotEscape,
     mandelbrotSmooth: mandelbrotSmooth,
     pixelToComplex: pixelToComplex,
     zoomAtPoint: zoomAtPoint,
     panByPixels: panByPixels,
-    zoomToRect: zoomToRect
+    zoomToRect: zoomToRect,
+    colorFor: colorFor,
+    paintCpuFullFrame: paintCpuFullFrame
   };
   if (typeof globalThis !== "undefined") {
     globalThis.MandelbrotMath = MandelbrotMath;
@@ -252,86 +303,215 @@
   var maxIter = 256;
 
   function iterationsForZoom(planeWidth) {
-    // More iterations as we zoom in; soft floor/ceiling
     var base = 128;
     var depth = Math.max(0, -Math.log2(planeWidth / DEFAULT_PLANE_WIDTH));
     return Math.min(4096, Math.floor(base + depth * 48));
   }
 
-  // ── Canvas / render ───────────────────────────────────────────────────
+  // ── Renderer: WebGL (primary) + Canvas2D CPU (fallback) ────────────────
 
   var canvas = document.getElementById("c");
-  var ctx = canvas.getContext("2d", { alpha: false });
   var infoEl = document.getElementById("info");
   var dpr = 1;
   var imgW = 0, imgH = 0;
-  var imageData = null;
   var dirty = true;
   var rendering = false;
   var renderToken = 0;
+  var backend = "none";
 
-  function resize() {
-    dpr = Math.min(window.devicePixelRatio || 1, 2);
-    var cssW = window.innerWidth;
-    var cssH = window.innerHeight;
-    imgW = Math.max(1, Math.floor(cssW * dpr));
-    imgH = Math.max(1, Math.floor(cssH * dpr));
-    canvas.width = imgW;
-    canvas.height = imgH;
-    canvas.style.width = cssW + "px";
-    canvas.style.height = cssH + "px";
-    imageData = ctx.createImageData(imgW, imgH);
-    dirty = true;
+  // CPU state
+  var ctx2d = null;
+  var imageData = null;
+
+  // WebGL state
+  var gl = null;
+  var glProgram = null;
+  var glUniforms = null;
+
+  var VERT_SRC =
+    "attribute vec2 a_pos;\n" +
+    "void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+
+  // Fragment shader: same escape-time + palette as JS mandelbrotSmooth/colorFor.
+  // gl_FragCoord is bottom-left origin; map so +imag is up like the JS path.
+  var FRAG_SRC =
+    "precision highp float;\n" +
+    "uniform vec2 u_res;\n" +
+    "uniform vec2 u_center;\n" +
+    "uniform float u_planeWidth;\n" +
+    "uniform float u_maxIter;\n" +
+    "\n" +
+    "vec3 hsl2rgb(float h, float s, float l) {\n" +
+    "  float c = (1.0 - abs(2.0 * l - 1.0)) * s;\n" +
+    "  float x = c * (1.0 - abs(mod(h * 6.0, 2.0) - 1.0));\n" +
+    "  float m = l - c * 0.5;\n" +
+    "  vec3 rgb;\n" +
+    "  float h6 = h * 6.0;\n" +
+    "  if (h6 < 1.0) rgb = vec3(c, x, 0.0);\n" +
+    "  else if (h6 < 2.0) rgb = vec3(x, c, 0.0);\n" +
+    "  else if (h6 < 3.0) rgb = vec3(0.0, c, x);\n" +
+    "  else if (h6 < 4.0) rgb = vec3(0.0, x, c);\n" +
+    "  else if (h6 < 5.0) rgb = vec3(x, 0.0, c);\n" +
+    "  else rgb = vec3(c, 0.0, x);\n" +
+    "  return rgb + m;\n" +
+    "}\n" +
+    "\n" +
+    "void main() {\n" +
+    "  float aspect = u_res.x / u_res.y;\n" +
+    "  float planeHeight = u_planeWidth / aspect;\n" +
+    "  // bottom-left → match JS top-left imag orientation\n" +
+    "  float re = u_center.x + (gl_FragCoord.x / u_res.x - 0.5) * u_planeWidth;\n" +
+    "  float im = u_center.y + (gl_FragCoord.y / u_res.y - 0.5) * planeHeight;\n" +
+    "\n" +
+    "  float zx = 0.0;\n" +
+    "  float zy = 0.0;\n" +
+    "  float zx2 = 0.0;\n" +
+    "  float zy2 = 0.0;\n" +
+    "  float i = 0.0;\n" +
+    "  // Hard cap matches iterationsForZoom max (4096)\n" +
+    "  for (int n = 0; n < 4096; n++) {\n" +
+    "    if (i >= u_maxIter || zx2 + zy2 > 256.0) break;\n" +
+    "    zy = 2.0 * zx * zy + im;\n" +
+    "    zx = zx2 - zy2 + re;\n" +
+    "    zx2 = zx * zx;\n" +
+    "    zy2 = zy * zy;\n" +
+    "    i += 1.0;\n" +
+    "  }\n" +
+    "\n" +
+    "  if (i >= u_maxIter) {\n" +
+    "    gl_FragColor = vec4(8.0/255.0, 8.0/255.0, 12.0/255.0, 1.0);\n" +
+    "    return;\n" +
+    "  }\n" +
+    "  float logZn = log(zx2 + zy2) * 0.5;\n" +
+    "  float nu = log(logZn / log(2.0)) / log(2.0);\n" +
+    "  float t = i + 1.0 - nu;\n" +
+    "  float v = t / u_maxIter;\n" +
+    "  float hue = mod(0.62 + 4.5 * v, 1.0);\n" +
+    "  float sat = 0.72;\n" +
+    "  float lit = 0.12 + 0.55 * pow(v, 0.55);\n" +
+    "  vec3 rgb = hsl2rgb(hue, sat, lit);\n" +
+    "  gl_FragColor = vec4(rgb, 1.0);\n" +
+    "}\n";
+
+  function compileShader(glctx, type, src) {
+    var sh = glctx.createShader(type);
+    glctx.shaderSource(sh, src);
+    glctx.compileShader(sh);
+    if (!glctx.getShaderParameter(sh, glctx.COMPILE_STATUS)) {
+      var info = glctx.getShaderInfoLog(sh);
+      glctx.deleteShader(sh);
+      throw new Error("shader compile: " + info);
+    }
+    return sh;
   }
 
-  /** HSL-like palette: interior black, exterior smooth bands. */
-  function colorFor(t, maxIt, out, off) {
-    if (t >= maxIt) {
-      out[off] = 8;
-      out[off + 1] = 8;
-      out[off + 2] = 12;
-      out[off + 3] = 255;
+  function initWebGL(canvasEl) {
+    var opts = {
+      alpha: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      preserveDrawingBuffer: true,
+      powerPreference: "high-performance"
+    };
+    var g =
+      canvasEl.getContext("webgl", opts) ||
+      canvasEl.getContext("experimental-webgl", opts);
+    if (!g) return null;
+
+    var vs = compileShader(g, g.VERTEX_SHADER, VERT_SRC);
+    var fs = compileShader(g, g.FRAGMENT_SHADER, FRAG_SRC);
+    var prog = g.createProgram();
+    g.attachShader(prog, vs);
+    g.attachShader(prog, fs);
+    g.linkProgram(prog);
+    if (!g.getProgramParameter(prog, g.LINK_STATUS)) {
+      throw new Error("program link: " + g.getProgramInfoLog(prog));
+    }
+    g.useProgram(prog);
+
+    var buf = g.createBuffer();
+    g.bindBuffer(g.ARRAY_BUFFER, buf);
+    // full-screen triangle strip (two triangles as clip-space quad)
+    g.bufferData(
+      g.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
+      g.STATIC_DRAW
+    );
+    var aPos = g.getAttribLocation(prog, "a_pos");
+    g.enableVertexAttribArray(aPos);
+    g.vertexAttribPointer(aPos, 2, g.FLOAT, false, 0, 0);
+
+    var uniforms = {
+      res: g.getUniformLocation(prog, "u_res"),
+      center: g.getUniformLocation(prog, "u_center"),
+      planeWidth: g.getUniformLocation(prog, "u_planeWidth"),
+      maxIter: g.getUniformLocation(prog, "u_maxIter")
+    };
+
+    g.disable(g.DEPTH_TEST);
+    g.disable(g.BLEND);
+
+    return { gl: g, program: prog, uniforms: uniforms };
+  }
+
+  function ensureWebGL() {
+    // Setting canvas.width/height resets the WebGL context; rebuild if needed.
+    if (!gl || gl.isContextLost()) {
+      var webgl = initWebGL(canvas);
+      if (!webgl) {
+        backend = "cpu";
+        if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
+        return false;
+      }
+      gl = webgl.gl;
+      glProgram = webgl.program;
+      glUniforms = webgl.uniforms;
+      backend = "webgl";
+      return true;
+    }
+    // Context exists but programs may be wiped after a canvas size change.
+    // Detect by checking the program is still valid.
+    if (!glProgram || !gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
+      var rebuilt = initWebGL(canvas);
+      if (!rebuilt) {
+        backend = "cpu";
+        if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
+        return false;
+      }
+      gl = rebuilt.gl;
+      glProgram = rebuilt.program;
+      glUniforms = rebuilt.uniforms;
+    }
+    return true;
+  }
+
+  function paintWebGL(sync) {
+    if (!ensureWebGL()) {
+      // Fall back mid-flight
+      if (!imageData && ctx2d) imageData = ctx2d.createImageData(imgW, imgH);
+      paintCpuFullFrame(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
+      ctx2d.putImageData(imageData, 0, 0);
       return;
     }
-    // Normalize and apply a clean multi-stop gradient
-    var v = t / maxIt;
-    var hue = (0.62 + 4.5 * v) % 1;
-    var sat = 0.72;
-    var lit = 0.12 + 0.55 * Math.pow(v, 0.55);
-    // HSL → RGB
-    var c = (1 - Math.abs(2 * lit - 1)) * sat;
-    var x = c * (1 - Math.abs((hue * 6) % 2 - 1));
-    var m = lit - c / 2;
-    var r = 0, g = 0, b = 0;
-    var h6 = hue * 6;
-    if (h6 < 1) { r = c; g = x; b = 0; }
-    else if (h6 < 2) { r = x; g = c; b = 0; }
-    else if (h6 < 3) { r = 0; g = c; b = x; }
-    else if (h6 < 4) { r = 0; g = x; b = c; }
-    else if (h6 < 5) { r = x; g = 0; b = c; }
-    else { r = c; g = 0; b = x; }
-    out[off] = Math.round((r + m) * 255);
-    out[off + 1] = Math.round((g + m) * 255);
-    out[off + 2] = Math.round((b + m) * 255);
-    out[off + 3] = 255;
+    var g = gl;
+    g.viewport(0, 0, imgW, imgH);
+    g.useProgram(glProgram);
+    g.uniform2f(glUniforms.res, imgW, imgH);
+    g.uniform2f(glUniforms.center, view.centerX, view.centerY);
+    g.uniform1f(glUniforms.planeWidth, view.planeWidth);
+    g.uniform1f(glUniforms.maxIter, maxIter);
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
+    if (sync) {
+      // Force GPU completion: finish + 1px readback (some drivers treat finish as a no-op hint)
+      g.finish();
+      var probe = new Uint8Array(4);
+      g.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, probe);
+    }
   }
 
-  function updateHud() {
-    var zoom = DEFAULT_PLANE_WIDTH / view.planeWidth;
-    var zoomStr = zoom >= 1e6
-      ? zoom.toExponential(2)
-      : zoom >= 1000
-        ? zoom.toFixed(0)
-        : zoom.toFixed(2);
-    infoEl.textContent =
-      "zoom ×" + zoomStr +
-      "\niter " + maxIter +
-      "\n" + view.centerX.toPrecision(8) + " + " + view.centerY.toPrecision(8) + "i";
-  }
-
-  function renderChunked(token) {
+  function paintCpuChunked(token) {
     if (token !== renderToken) return;
-    maxIter = iterationsForZoom(view.planeWidth);
     var data = imageData.data;
     var w = imgW, h = imgH;
     var cx = view.centerX, cy = view.centerY, pw = view.planeWidth;
@@ -341,7 +521,6 @@
     var im0 = cy + ph / 2;
     var dre = pw / w;
     var dim = -ph / h;
-
     var rowsPerChunk = Math.max(4, Math.floor(120000 / w));
     var y = 0;
 
@@ -357,7 +536,7 @@
           colorFor(t, maxIter, data, rowOff + x * 4);
         }
       }
-      ctx.putImageData(imageData, 0, 0);
+      ctx2d.putImageData(imageData, 0, 0);
       if (y < h) {
         requestAnimationFrame(step);
       } else {
@@ -368,23 +547,224 @@
     requestAnimationFrame(step);
   }
 
+  /** Full-frame paint used by the live app (and perf harness). */
+  function paintFrame(token, sync) {
+    maxIter = iterationsForZoom(view.planeWidth);
+    if (backend === "webgl") {
+      paintWebGL(!!sync);
+      rendering = false;
+      updateHud();
+      return;
+    }
+    // CPU fallback: chunked unless sync (perf / forced full frame)
+    if (sync) {
+      paintCpuFullFrame(imgW, imgH, view.centerX, view.centerY, view.planeWidth, maxIter, imageData.data);
+      ctx2d.putImageData(imageData, 0, 0);
+      rendering = false;
+      updateHud();
+      return;
+    }
+    paintCpuChunked(token);
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var cssW = window.innerWidth;
+    var cssH = window.innerHeight;
+    var nextW = Math.max(1, Math.floor(cssW * dpr));
+    var nextH = Math.max(1, Math.floor(cssH * dpr));
+    var sizeChanged = nextW !== imgW || nextH !== imgH;
+    imgW = nextW;
+    imgH = nextH;
+    if (sizeChanged || canvas.width !== imgW || canvas.height !== imgH) {
+      canvas.width = imgW;
+      canvas.height = imgH;
+      // Canvas resize resets WebGL; rebuild programs/buffers
+      if (backend === "webgl") {
+        gl = null;
+        glProgram = null;
+        glUniforms = null;
+        ensureWebGL();
+      }
+    }
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    if (backend === "cpu" && ctx2d) {
+      imageData = ctx2d.createImageData(imgW, imgH);
+    }
+    dirty = true;
+  }
+
+  function updateHud() {
+    var zoom = DEFAULT_PLANE_WIDTH / view.planeWidth;
+    var zoomStr = zoom >= 1e6
+      ? zoom.toExponential(2)
+      : zoom >= 1000
+        ? zoom.toFixed(0)
+        : zoom.toFixed(2);
+    infoEl.textContent =
+      "zoom ×" + zoomStr +
+      "\niter " + maxIter +
+      "\n" + view.centerX.toPrecision(8) + " + " + view.centerY.toPrecision(8) + "i";
+  }
+
   function requestRender() {
     dirty = true;
   }
 
   function frame() {
-    if (dirty && !rendering) {
+    if (dirty) {
       dirty = false;
       rendering = true;
       renderToken++;
-      renderChunked(renderToken);
-    } else if (dirty && rendering) {
-      // Cancel in-progress pass and restart with latest view
-      dirty = false;
-      renderToken++;
-      renderChunked(renderToken);
+      // WebGL paints in one shot; CPU may chunk
+      paintFrame(renderToken, false);
     }
     requestAnimationFrame(frame);
+  }
+
+  // Init backend: prefer WebGL
+  try {
+    var webgl = initWebGL(canvas);
+    if (webgl) {
+      gl = webgl.gl;
+      glProgram = webgl.program;
+      glUniforms = webgl.uniforms;
+      backend = "webgl";
+    }
+  } catch (e) {
+    backend = "none";
+    gl = null;
+  }
+  if (backend !== "webgl") {
+    ctx2d = canvas.getContext("2d", { alpha: false });
+    if (!ctx2d) {
+      infoEl.textContent = "No canvas rendering available.";
+    } else {
+      backend = "cpu";
+    }
+  }
+
+  // Perf / test surface: drive shipped paint paths without re-implementing math
+  var MandelbrotApp = {
+    getBackend: function () { return backend; },
+    getSize: function () { return { w: imgW, h: imgH }; },
+    getView: function () {
+      return {
+        centerX: view.centerX,
+        centerY: view.centerY,
+        planeWidth: view.planeWidth,
+        maxIter: maxIter
+      };
+    },
+    setView: function (centerX, centerY, planeWidth) {
+      view.centerX = centerX;
+      view.centerY = centerY;
+      view.planeWidth = planeWidth;
+    },
+    iterationsForZoom: iterationsForZoom,
+    /**
+     * Time a full-frame paint of the active backend (WebGL with gl.finish, or CPU sync).
+     * Optionally override size by temporarily resizing canvas buffers.
+     */
+    paintFullFrameSync: function (opts) {
+      opts = opts || {};
+      var w = opts.w || imgW;
+      var h = opts.h || imgH;
+      var cx = opts.centerX != null ? opts.centerX : view.centerX;
+      var cy = opts.centerY != null ? opts.centerY : view.centerY;
+      var pw = opts.planeWidth != null ? opts.planeWidth : view.planeWidth;
+      var mi = opts.maxIter != null ? opts.maxIter : iterationsForZoom(pw);
+
+      var prev = {
+        w: imgW, h: imgH,
+        cx: view.centerX, cy: view.centerY, pw: view.planeWidth, mi: maxIter,
+        cssW: canvas.style.width, cssH: canvas.style.height
+      };
+
+      var sizeChanged = w !== imgW || h !== imgH;
+      imgW = w;
+      imgH = h;
+      view.centerX = cx;
+      view.centerY = cy;
+      view.planeWidth = pw;
+      maxIter = mi;
+
+      if (sizeChanged) {
+        canvas.width = w;
+        canvas.height = h;
+        if (backend === "webgl" || gl) {
+          gl = null;
+          glProgram = null;
+          glUniforms = null;
+        }
+      }
+
+      if (backend === "cpu" || (!gl && backend !== "webgl")) {
+        if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
+        if (ctx2d) imageData = ctx2d.createImageData(w, h);
+      }
+
+      // Rebuild GL after size change before timing the actual paint
+      if (backend === "webgl") {
+        ensureWebGL();
+      }
+
+      var usedBackend = backend;
+      var t0 = performance.now();
+      if (backend === "webgl" && gl) {
+        paintWebGL(true);
+        usedBackend = "webgl";
+      } else {
+        if (!imageData && ctx2d) imageData = ctx2d.createImageData(w, h);
+        paintCpuFullFrame(w, h, cx, cy, pw, mi, imageData.data);
+        ctx2d.putImageData(imageData, 0, 0);
+        usedBackend = "cpu";
+      }
+      var t1 = performance.now();
+
+      // restore interactive size/view
+      imgW = prev.w;
+      imgH = prev.h;
+      view.centerX = prev.cx;
+      view.centerY = prev.cy;
+      view.planeWidth = prev.pw;
+      maxIter = prev.mi;
+      if (sizeChanged) {
+        canvas.width = prev.w;
+        canvas.height = prev.h;
+        if (backend === "webgl") {
+          gl = null;
+          glProgram = null;
+          glUniforms = null;
+          ensureWebGL();
+        }
+      }
+      if (backend === "cpu" && ctx2d) {
+        imageData = ctx2d.createImageData(prev.w, prev.h);
+      }
+      dirty = true;
+
+      return { ms: t1 - t0, backend: usedBackend, w: w, h: h, maxIter: mi };
+    },
+    /** Always times the shipped CPU full-frame path (baseline reference). */
+    paintCpuFullFrameSync: function (opts) {
+      opts = opts || {};
+      var w = opts.w || 960;
+      var h = opts.h || 640;
+      var cx = opts.centerX != null ? opts.centerX : -0.743643887037151;
+      var cy = opts.centerY != null ? opts.centerY : 0.13182590420533;
+      var pw = opts.planeWidth != null ? opts.planeWidth : 0.002;
+      var mi = opts.maxIter != null ? opts.maxIter : 512;
+      var buf = new Uint8ClampedArray(w * h * 4);
+      var t0 = performance.now();
+      paintCpuFullFrame(w, h, cx, cy, pw, mi, buf);
+      var t1 = performance.now();
+      return { ms: t1 - t0, backend: "cpu", w: w, h: h, maxIter: mi, bytes: buf.length };
+    }
+  };
+  if (typeof globalThis !== "undefined") {
+    globalThis.MandelbrotApp = MandelbrotApp;
   }
 
   // ── Input: pan + wheel zoom + Ctrl+drag marquee ────────────────────────
@@ -392,7 +772,7 @@
   var pointers = new Map();
   var lastPinchDist = 0;
   var marqueeEl = document.getElementById("marquee");
-  var marquee = null; // { pointerId, x0, y0, x1, y1 } in client coords
+  var marquee = null;
 
   function cssToPixel(clientX, clientY) {
     var rect = canvas.getBoundingClientRect();
@@ -418,18 +798,18 @@
     marqueeEl.style.height = height + "px";
   }
 
+  var ctrlHeld = false;
+
   function clearMarquee() {
     marquee = null;
     canvas.classList.remove("selecting");
-    // Keep crosshair if Ctrl is still held
     if (ctrlHeld) canvas.classList.add("ctrl-ready");
     updateMarqueeEl();
   }
 
-  var ctrlHeld = false;
   function setCtrlHeld(down) {
     ctrlHeld = down;
-    if (marquee) return; // selecting class already owns the cursor
+    if (marquee) return;
     if (down) {
       canvas.classList.add("ctrl-ready");
       canvas.classList.remove("dragging");
@@ -465,7 +845,6 @@
   }
 
   canvas.addEventListener("pointerdown", function (e) {
-    // Ctrl+drag: rubber-band zoom rect (primary button only)
     if (e.ctrlKey && e.button === 0) {
       e.preventDefault();
       canvas.setPointerCapture(e.pointerId);
@@ -494,7 +873,6 @@
   });
 
   canvas.addEventListener("pointermove", function (e) {
-    // Sync Ctrl state from event (covers hold without prior keydown on this tab)
     if (e.ctrlKey !== ctrlHeld && !marquee) setCtrlHeld(e.ctrlKey);
 
     if (marquee && e.pointerId === marquee.pointerId) {
@@ -560,9 +938,7 @@
   canvas.addEventListener("wheel", function (e) {
     e.preventDefault();
     var pix = cssToPixel(e.clientX, e.clientY);
-    // Smooth exponential zoom; deltaY > 0 → zoom out
     var factor = Math.exp(e.deltaY * 0.0015);
-    // Clamp single-step to avoid wild jumps
     if (factor < 0.5) factor = 0.5;
     if (factor > 2) factor = 2;
     var z = zoomAtPoint(pix.x, pix.y, imgW, imgH, view.centerX, view.centerY, view.planeWidth, factor);
